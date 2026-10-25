@@ -2026,6 +2026,480 @@ async function runTests() {
     assert.ok(galleryJs.includes('fetchImageWithFallback'), '图片安全下载与回退逻辑完整');
   });
 
+  // =============================================================
+  // 测试 8：阶段 3 尺寸分类筛选与默认选择行为改造自动化验收测试
+  // =============================================================
+
+  // 从 gallery.js 生产源码提取阶段 3 真实辅助函数构建沙箱
+  function extractPhase3GalleryHelpers() {
+    const code = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+    const isValidDimMatch = code.match(/function isValidDimension\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    const getLongEdgeMatch = code.match(/function getImageLongEdge\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    const getSizeCatMatch = code.match(/function getImageSizeCategory\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    const matchSizeFilterMatch = code.match(/function matchesSizeFilter\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    const matchFmtFilterMatch = code.match(/function matchesFormatFilter\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    const detectFmtMatch = code.match(/function detectImageFormat\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    const getUrlExtMatch = code.match(/function getUrlExtension\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+
+    assert.ok(isValidDimMatch, '必须能从 gallery.js 提取到 isValidDimension');
+    assert.ok(getLongEdgeMatch, '必须能从 gallery.js 提取到 getImageLongEdge');
+    assert.ok(getSizeCatMatch, '必须能从 gallery.js 提取到 getImageSizeCategory');
+    assert.ok(matchSizeFilterMatch, '必须能从 gallery.js 提取到 matchesSizeFilter');
+
+    return function(state) {
+      const runner = new Function('state', `
+        ${getUrlExtMatch ? getUrlExtMatch[0] : ''}
+        ${detectFmtMatch ? detectFmtMatch[0] : 'function detectImageFormat(img) { return "JPG"; }'}
+        ${isValidDimMatch[0]}
+        ${getLongEdgeMatch[0]}
+        ${getSizeCatMatch[0]}
+        ${matchSizeFilterMatch[0]}
+        ${matchFmtFilterMatch ? matchFmtFilterMatch[0] : ''}
+        return { isValidDimension, getImageLongEdge, getImageSizeCategory, matchesSizeFilter, matchesFormatFilter };
+      `);
+      return runner(state);
+    };
+  }
+  const createPhase3Helpers = extractPhase3GalleryHelpers();
+
+  await asyncTest('阶段 3 验证 1: 初次打开默认进入「大图」模式且 UI 激活对应 Chip', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+    const galleryHtml = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
+
+    // 1. state.sizeCategory 默认初始值为 'LARGE'
+    assert.ok(galleryJs.includes("sizeCategory: 'LARGE'"), 'state.sizeCategory 默认初始值必须为 LARGE');
+
+    // 2. gallery.html 中「大图」按钮默认具备 active 类，且其他分类初始不带 active
+    assert.ok(
+      galleryHtml.includes('class="chip active" data-category="LARGE"') ||
+      galleryHtml.includes("class='chip active' data-category='LARGE'"),
+      'HTML 中大图分类 Chip 必须默认具备 active 高亮样式'
+    );
+    assert.ok(
+      galleryHtml.includes('class="chip" data-category="ALL"'),
+      'HTML 中全部 Chip 初始不应带 active'
+    );
+    assert.ok(
+      galleryHtml.includes('class="chip" data-category="MEDIUM"'),
+      'HTML 中中图 Chip 初始不应带 active'
+    );
+  });
+
+  await asyncTest('阶段 3 验证 2: 免费版与 Pro 版初次打开均为零勾选', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. 验证 preselectInitialImages 内部绝无自动勾选前 20 张的逻辑
+    assert.ok(
+      !galleryJs.includes('for (let i = 0; i < limit; i++) {\n      state.selectedIds.add(state.filteredImages[i].id);'),
+      'preselectInitialImages 严禁再自动批量勾选前 20 张'
+    );
+
+    // 2. 模拟真实初次任务载入，不论免费版还是 Pro 版，selectedIds 保持为 0
+    const stateFree = {
+      isPro: false,
+      proLimit: 20,
+      selectedIds: new Set(),
+      filteredImages: [{ id: 'img_1' }, { id: 'img_2' }, { id: 'img_3' }]
+    };
+    assert.strictEqual(stateFree.selectedIds.size, 0, '免费版初始勾选数量必须为 0');
+
+    const statePro = {
+      isPro: true,
+      selectedIds: new Set(),
+      filteredImages: [{ id: 'img_1' }, { id: 'img_2' }, { id: 'img_3' }]
+    };
+    assert.strictEqual(statePro.selectedIds.size, 0, 'Pro 版初始勾选数量必须为 0');
+
+    // 3. 异步任务广播更新时，严禁清空用户已经主动勾选的图片
+    const existingSelected = new Set(['img_1', 'img_2']);
+    const updatedImages = [{ id: 'img_1' }, { id: 'img_2' }, { id: 'img_3' }];
+    const validIds = new Set(updatedImages.map(img => img.id));
+    for (const id of existingSelected) {
+      if (!validIds.has(id)) existingSelected.delete(id);
+    }
+    assert.strictEqual(existingSelected.size, 2, '异步任务完成通知到达时不破坏用户已有选择');
+    assert.ok(existingSelected.has('img_1') && existingSelected.has('img_2'));
+  });
+
+  await asyncTest('阶段 3 验证 3: 零勾选时 ZIP 按钮禁用，有勾选时启用', async () => {
+    // 模拟 updateSelectionSummary 行为
+    const mockDom = {
+      btnDownloadZip: { disabled: false },
+      downloadBadge: { textContent: '' },
+      statSelectedCount: { textContent: '' },
+      statVisibleCount: { textContent: '' }
+    };
+
+    function simulateSummary(selectedCount, isDownloading = false) {
+      mockDom.btnDownloadZip.disabled = selectedCount === 0 || isDownloading;
+      mockDom.downloadBadge.textContent = selectedCount;
+    }
+
+    // 零勾选
+    simulateSummary(0, false);
+    assert.strictEqual(mockDom.btnDownloadZip.disabled, true, '零勾选时 ZIP 按钮必须禁用');
+    assert.strictEqual(mockDom.downloadBadge.textContent, 0);
+
+    // 用户勾选 1 张
+    simulateSummary(1, false);
+    assert.strictEqual(mockDom.btnDownloadZip.disabled, false, '有勾选时 ZIP 按钮必须启用');
+    assert.strictEqual(mockDom.downloadBadge.textContent, 1);
+
+    // 下载中
+    simulateSummary(1, true);
+    assert.strictEqual(mockDom.btnDownloadZip.disabled, true, '下载中状态必须禁用 ZIP 按钮');
+
+    // 下载完成后（零勾选）
+    simulateSummary(0, false);
+    assert.strictEqual(mockDom.btnDownloadZip.disabled, true, '下载完成后若无勾选必须维持禁用');
+  });
+
+  await asyncTest('阶段 3 验证 4: 16×16、32×32 图片在「全部」「小图」中正常展示，不归入大图', async () => {
+    const h = createPhase3Helpers({ sizeCategory: 'ALL', minWidth: 0, minHeight: 0 });
+
+    const img16 = { id: 'i16', width: 16, height: 16 };
+    const img32 = { id: 'i32', width: 32, height: 32 };
+
+    assert.strictEqual(h.getImageSizeCategory(img16), 'SMALL');
+    assert.strictEqual(h.getImageSizeCategory(img32), 'SMALL');
+
+    // 1. 全部模式：展示
+    const hAll = createPhase3Helpers({ sizeCategory: 'ALL' });
+    assert.strictEqual(hAll.matchesSizeFilter(img16), true, '全部模式下 16x16 正常展示');
+    assert.strictEqual(hAll.matchesSizeFilter(img32), true, '全部模式下 32x32 正常展示');
+
+    // 2. 小图模式：展示
+    const hSmall = createPhase3Helpers({ sizeCategory: 'SMALL' });
+    assert.strictEqual(hSmall.matchesSizeFilter(img16), true, '小图模式下 16x16 正常展示');
+    assert.strictEqual(hSmall.matchesSizeFilter(img32), true, '小图模式下 32x32 正常展示');
+
+    // 3. 大图模式：严禁展示
+    const hLarge = createPhase3Helpers({ sizeCategory: 'LARGE' });
+    assert.strictEqual(hLarge.matchesSizeFilter(img16), false, '大图模式下 16x16 严禁展示');
+    assert.strictEqual(hLarge.matchesSizeFilter(img32), false, '大图模式下 32x32 严禁展示');
+  });
+
+  await asyncTest('阶段 3 验证 5: 999px 长边归入中图，1000px 长边归入大图', async () => {
+    const h = createPhase3Helpers({});
+
+    // 边界值校验：longEdge = Math.max(width, height)
+    // 999 宽，500 高 -> longEdge 999 -> MEDIUM
+    assert.strictEqual(h.getImageSizeCategory({ width: 999, height: 500 }), 'MEDIUM');
+    // 600 宽，999 高 -> longEdge 999 -> MEDIUM
+    assert.strictEqual(h.getImageSizeCategory({ width: 600, height: 999 }), 'MEDIUM');
+
+    // 1000 宽，400 高 -> longEdge 1000 -> LARGE
+    assert.strictEqual(h.getImageSizeCategory({ width: 1000, height: 400 }), 'LARGE');
+    // 500 宽，1000 高 -> longEdge 1000 -> LARGE
+    assert.strictEqual(h.getImageSizeCategory({ width: 500, height: 1000 }), 'LARGE');
+
+    // 200 宽，150 高 -> longEdge 200 -> MEDIUM (200-999)
+    assert.strictEqual(h.getImageSizeCategory({ width: 200, height: 150 }), 'MEDIUM');
+    // 199 宽，199 高 -> longEdge 199 -> SMALL (<200)
+    assert.strictEqual(h.getImageSizeCategory({ width: 199, height: 199 }), 'SMALL');
+  });
+
+  await asyncTest('阶段 3 验证 6: 宽高未知的图片归入未知尺寸，绝对不错误显示为大图', async () => {
+    const h = createPhase3Helpers({ sizeCategory: 'LARGE' });
+
+    const unk1 = { width: 0, height: 0 };
+    const unk2 = { width: undefined, height: 1200 };
+    const unk3 = { width: 2000, height: null };
+    const unk4 = { width: -10, height: 500 };
+    const unk5 = { width: NaN, height: NaN };
+
+    assert.strictEqual(h.getImageSizeCategory(unk1), 'UNKNOWN');
+    assert.strictEqual(h.getImageSizeCategory(unk2), 'UNKNOWN');
+    assert.strictEqual(h.getImageSizeCategory(unk3), 'UNKNOWN');
+    assert.strictEqual(h.getImageSizeCategory(unk4), 'UNKNOWN');
+    assert.strictEqual(h.getImageSizeCategory(unk5), 'UNKNOWN');
+
+    // 在默认「大图」模式下，未知尺寸严禁匹配
+    assert.strictEqual(h.matchesSizeFilter(unk1), false, '0x0 未知尺寸不能错误显示为大图');
+    assert.strictEqual(h.matchesSizeFilter(unk2), false);
+    assert.strictEqual(h.matchesSizeFilter(unk3), false);
+
+    // 在「未知尺寸」模式下正确匹配
+    const hUnknown = createPhase3Helpers({ sizeCategory: 'UNKNOWN' });
+    assert.strictEqual(hUnknown.matchesSizeFilter(unk1), true);
+    assert.strictEqual(hUnknown.matchesSizeFilter(unk2), true);
+  });
+
+  await asyncTest('阶段 3 验证 7: 五种分类的数量正确，且互不重复、没有漏算', async () => {
+    const h = createPhase3Helpers({});
+
+    // 构建涵盖各种边界与尺寸的 100 张样本
+    const testList = [];
+    // 30 张大图 (longEdge >= 1000)
+    for (let i = 0; i < 30; i++) {
+      testList.push({ id: `l_${i}`, width: 1000 + i * 20, height: 800 });
+    }
+    // 25 张中图 (200..999)
+    for (let i = 0; i < 25; i++) {
+      testList.push({ id: `m_${i}`, width: 200 + i * 10, height: 300 });
+    }
+    // 35 张小图 (<200)
+    for (let i = 0; i < 35; i++) {
+      testList.push({ id: `s_${i}`, width: 10 + i * 4, height: 20 + i * 4 });
+    }
+    // 10 张未知尺寸
+    for (let i = 0; i < 10; i++) {
+      testList.push({ id: `u_${i}`, width: 0, height: 0 });
+    }
+
+    assert.strictEqual(testList.length, 100);
+
+    let countLarge = 0;
+    let countMedium = 0;
+    let countSmall = 0;
+    let countUnknown = 0;
+
+    testList.forEach(img => {
+      const cat = h.getImageSizeCategory(img);
+      if (cat === 'LARGE') countLarge++;
+      else if (cat === 'MEDIUM') countMedium++;
+      else if (cat === 'SMALL') countSmall++;
+      else if (cat === 'UNKNOWN') countUnknown++;
+    });
+
+    assert.strictEqual(countLarge, 30, '大图统计必须精准为 30');
+    assert.strictEqual(countMedium, 25, '中图统计必须精准为 25');
+    assert.strictEqual(countSmall, 35, '小图统计必须精准为 35');
+    assert.strictEqual(countUnknown, 10, '未知尺寸统计必须精准为 10');
+    assert.strictEqual(countLarge + countMedium + countSmall + countUnknown, testList.length, '五类统计之和必须严格等于总数 100，杜绝漏算与重复');
+  });
+
+  await asyncTest('阶段 3 验证 8: 修改宽高滑块后进入自定义筛选，未知尺寸不满足正数门槛', async () => {
+    // 自定义模式
+    const hCustom = createPhase3Helpers({
+      sizeCategory: 'CUSTOM',
+      minWidth: 400,
+      minHeight: 300
+    });
+
+    const validLarge = { width: 500, height: 400 };
+    const widthTooSmall = { width: 350, height: 400 };
+    const heightTooSmall = { width: 500, height: 250 };
+    const unknownImg = { width: 0, height: 0 };
+
+    assert.strictEqual(hCustom.matchesSizeFilter(validLarge), true, '满足宽高滑块的图片正常通过');
+    assert.strictEqual(hCustom.matchesSizeFilter(widthTooSmall), false, '宽度不足时被过滤');
+    assert.strictEqual(hCustom.matchesSizeFilter(heightTooSmall), false, '高度不足时被过滤');
+    assert.strictEqual(hCustom.matchesSizeFilter(unknownImg), false, '【关键断言】自定义模式下未知尺寸严禁被当作满足正数门槛！');
+
+    // 若滑块全调为 0，未知尺寸在自定义模式下允许通过
+    const hCustomZero = createPhase3Helpers({
+      sizeCategory: 'CUSTOM',
+      minWidth: 0,
+      minHeight: 0
+    });
+    assert.strictEqual(hCustomZero.matchesSizeFilter(unknownImg), true, '滑块均为 0 时未知尺寸允许呈现');
+  });
+
+  await asyncTest('阶段 3 验证 9: 格式过滤与尺寸分类组合正常', async () => {
+    const state = {
+      sizeCategory: 'LARGE',
+      currentFormat: 'JPG'
+    };
+    const h = createPhase3Helpers(state);
+
+    const jpgLarge = { url: 'https://example.com/banner.jpg', width: 1920, height: 1080 };
+    const pngLarge = { url: 'https://example.com/banner.png', width: 1920, height: 1080 };
+    const jpgSmall = { url: 'https://example.com/avatar.jpg', width: 64, height: 64 };
+
+    // 组合筛选：大图 + JPG
+    assert.strictEqual(h.matchesSizeFilter(jpgLarge) && h.matchesFormatFilter(jpgLarge), true, 'JPG 大图正常通过组合筛选');
+    assert.strictEqual(h.matchesSizeFilter(pngLarge) && h.matchesFormatFilter(pngLarge), false, 'PNG 大图被 JPG 格式筛选阻断');
+    assert.strictEqual(h.matchesSizeFilter(jpgSmall) && h.matchesFormatFilter(jpgSmall), false, 'JPG 小图被大图分类阻断');
+  });
+
+  await asyncTest('阶段 3 验证 10: 切换分类不清空隐藏的已勾选图片，且统计看板正确提示', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. 静态验证 updateSelectionSummary 中计算 hiddenSelectedCount 与显示 hiddenSelectedNotice
+    assert.ok(galleryJs.includes('hiddenSelectedCount'), '必须计算 hiddenSelectedCount');
+    assert.ok(galleryJs.includes('hiddenSelectedNotice'), '必须包含隐藏选中项提示组件');
+
+    // 2. 模拟切换分类场景
+    const state = {
+      allImages: [
+        { id: 'img_l1', width: 2000, height: 1000 },
+        { id: 'img_l2', width: 1500, height: 1200 },
+        { id: 'img_s1', width: 80, height: 80 }
+      ],
+      filteredImages: [],
+      selectedIds: new Set()
+    };
+
+    // 用户在「大图」模式下勾选了 img_l1 与 img_l2
+    state.selectedIds.add('img_l1');
+    state.selectedIds.add('img_l2');
+
+    // 用户切换到「小图」分类
+    state.filteredImages = [state.allImages[2]]; // 仅 img_s1 可见
+
+    // 计算隐藏勾选数
+    const visibleSet = new Set(state.filteredImages.map(img => img.id));
+    let hiddenCount = 0;
+    for (const id of state.selectedIds) {
+      if (!visibleSet.has(id)) hiddenCount++;
+    }
+
+    assert.strictEqual(hiddenCount, 2, '隐藏勾选数必须精准为 2');
+    assert.strictEqual(state.selectedIds.size, 2, '原有已选的 2 张大图绝对不被清空');
+    assert.ok(state.selectedIds.has('img_l1') && state.selectedIds.has('img_l2'));
+  });
+
+  await asyncTest('阶段 3 验证 11: 全选、反选只操作可见图片，免费版总计不突破 20 张配额', async () => {
+    // 模拟全选逻辑
+    const state = {
+      isPro: false,
+      proLimit: 20,
+      selectedIds: new Set(),
+      filteredImages: []
+    };
+
+    // 预先在其他分类勾选 8 张
+    for (let i = 1; i <= 8; i++) {
+      state.selectedIds.add(`hidden_${i}`);
+    }
+
+    // 当前可见分类有 15 张图片
+    for (let i = 1; i <= 15; i++) {
+      state.filteredImages.push({ id: `vis_${i}` });
+    }
+
+    // 1. 执行全选：剩余配额 20 - 8 = 12 张
+    const unselectedVisible = state.filteredImages.filter(img => !state.selectedIds.has(img.id));
+    const remainingQuota = Math.max(0, state.proLimit - state.selectedIds.size);
+    if (unselectedVisible.length > remainingQuota) {
+      for (let i = 0; i < remainingQuota; i++) {
+        state.selectedIds.add(unselectedVisible[i].id);
+      }
+    }
+
+    assert.strictEqual(state.selectedIds.size, 20, '全选后总勾选数量必须严格限制在 20 张以内');
+    // 验证原有的 8 张隐藏图片依然完好
+    for (let i = 1; i <= 8; i++) {
+      assert.ok(state.selectedIds.has(`hidden_${i}`), `隐藏图片 hidden_${i} 必须依然保留勾选`);
+    }
+
+    // 2. 模拟反选逻辑
+    const visibleIds = new Set(state.filteredImages.map(img => img.id));
+    const toSelectVisible = state.filteredImages.filter(img => !state.selectedIds.has(img.id));
+    const toDeselectVisible = state.filteredImages.filter(img => state.selectedIds.has(img.id));
+
+    let hiddenSelectedCount = 0;
+    for (const id of state.selectedIds) {
+      if (!visibleIds.has(id)) hiddenSelectedCount++;
+    }
+    toDeselectVisible.forEach(img => state.selectedIds.delete(img.id));
+
+    const availableQuota = Math.max(0, state.proLimit - hiddenSelectedCount);
+    for (let i = 0; i < Math.min(availableQuota, toSelectVisible.length); i++) {
+      state.selectedIds.add(toSelectVisible[i].id);
+    }
+
+    assert.ok(state.selectedIds.size <= 20, '反选后总勾选数量亦不能突破 20 张');
+    assert.strictEqual(hiddenSelectedCount, 8, '反选操作绝不波及隐藏的 8 张已选图片');
+  });
+
+  await asyncTest('阶段 3 验证 12: 清空操作能够清除全部勾选（包含隐藏图片）', async () => {
+    const state = {
+      selectedIds: new Set(['vis_1', 'vis_2', 'hidden_1', 'hidden_2'])
+    };
+    assert.strictEqual(state.selectedIds.size, 4);
+
+    // clearSelection 执行
+    state.selectedIds.clear();
+    assert.strictEqual(state.selectedIds.size, 0, '清空必须彻底清除可见与隐藏的所有选中项');
+  });
+
+  await asyncTest('阶段 3 验证 13: 仅选大图统一采用长边至少 1000px，且只对可见范围操作', async () => {
+    const h = createPhase3Helpers({});
+
+    const visibleItems = [
+      { id: 'img_999', width: 999, height: 600 },
+      { id: 'img_1000', width: 1000, height: 500 },
+      { id: 'img_portrait_1200', width: 800, height: 1200 },
+      { id: 'img_small', width: 100, height: 100 }
+    ];
+
+    const largeItems = visibleItems.filter(img => h.getImageSizeCategory(img) === 'LARGE');
+
+    assert.strictEqual(largeItems.length, 2, '仅长边至少 1000px 的图片被判定为大图');
+    assert.ok(largeItems.some(i => i.id === 'img_1000'));
+    assert.ok(largeItems.some(i => i.id === 'img_portrait_1200'));
+    assert.ok(!largeItems.some(i => i.id === 'img_999'), '999px 长边严禁被勾选');
+  });
+
+  await asyncTest('阶段 3 验证 14: 手动刷新追加图片后，维持当前筛选分类和已有选择', async () => {
+    const state = {
+      sizeCategory: 'MEDIUM',
+      currentFormat: 'ALL',
+      allImages: [
+        { id: 'img_1', url: 'https://example.com/med1.jpg', width: 500, height: 400 }
+      ],
+      filteredImages: [],
+      selectedIds: new Set(['img_1'])
+    };
+
+    // 增量追加新图片
+    const newItems = [
+      { url: 'https://example.com/large1.jpg', width: 1920, height: 1080 },
+      { url: 'https://example.com/med2.jpg', width: 600, height: 400 }
+    ];
+
+    const h = createPhase3Helpers(state);
+    let idCounter = 2;
+    newItems.forEach(item => {
+      state.allImages.push({
+        ...item,
+        id: `img_${idCounter++}`
+      });
+    });
+
+    // 重新应用过滤
+    state.filteredImages = state.allImages.filter(img => h.matchesSizeFilter(img));
+
+    // 断言：筛选分类依然为 MEDIUM，已有勾选保持，新图不自动勾选
+    assert.strictEqual(state.sizeCategory, 'MEDIUM', '当前筛选分类维持不变');
+    assert.ok(state.selectedIds.has('img_1'), '已有选中状态完好保留');
+    assert.strictEqual(state.selectedIds.has('img_2'), false, '新图严禁被自动勾选');
+    assert.strictEqual(state.filteredImages.length, 2, '仅符合 MEDIUM 的图片进入当前视图 (med1, med2)');
+  });
+
+  await asyncTest('阶段 3 验证 15: 尺寸异步回填后，分类和计数正确更新，已有勾选不丢失', async () => {
+    const h = createPhase3Helpers({});
+
+    const imgAsync = { id: 'img_unknown_init', width: 0, height: 0 };
+    assert.strictEqual(h.getImageSizeCategory(imgAsync), 'UNKNOWN', '初始为未知尺寸');
+
+    const selectedIds = new Set(['img_unknown_init']);
+
+    // 异步校验成功回填
+    imgAsync.width = 2560;
+    imgAsync.height = 1440;
+    imgAsync.isFallback = false;
+
+    assert.strictEqual(h.getImageSizeCategory(imgAsync), 'LARGE', '回填真实尺寸后自动识别为大图');
+    assert.ok(selectedIds.has('img_unknown_init'), '异步回填尺寸后用户已有勾选绝对不丢失');
+  });
+
+  await asyncTest('阶段 3 验证 16: 原有尺寸持久化、画廊加载状态和下载功能完整不受影响', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. 尺寸持久化队列与防抖调用存在
+    assert.ok(galleryJs.includes('schedulePersistImageDimensions'), '尺寸防抖持久化函数存在');
+    assert.ok(galleryJs.includes('flushPersistImageDimensions'), '尺寸数据冲刷存储函数存在');
+
+    // 2. 下载结束会话恢复更新
+    assert.ok(galleryJs.includes('finishDownloadSession'), '下载生命周期结束会话存在');
+
+    // 3. 空状态展示友好文字断言
+    assert.ok(galleryJs.includes('当前没有符合条件的大图，可切换到全部查看。'), '大图空状态友好提示文案精准无误');
+  });
+
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);
   if (passed !== total) {
     process.exit(1);

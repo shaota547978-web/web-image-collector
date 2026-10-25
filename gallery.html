@@ -87,20 +87,30 @@
   <section class="toolbar-section">
     <!-- 快捷过滤滑块 -->
     <div class="filter-group">
+      <!-- 尺寸分类切换 -->
+      <div class="size-category-chips" id="sizeCategoryChips">
+        <button class="chip" data-category="ALL" id="chipCatAll">全部 <span class="chip-count" id="countCatAll">(0)</span></button>
+        <button class="chip active" data-category="LARGE" id="chipCatLarge">大图 <span class="chip-count" id="countCatLarge">(0)</span></button>
+        <button class="chip" data-category="MEDIUM" id="chipCatMedium">中图 <span class="chip-count" id="countCatMedium">(0)</span></button>
+        <button class="chip" data-category="SMALL" id="chipCatSmall">小图 <span class="chip-count" id="countCatSmall">(0)</span></button>
+        <button class="chip" data-category="UNKNOWN" id="chipCatUnknown">未知尺寸 <span class="chip-count" id="countCatUnknown">(0)</span></button>
+        <button class="chip" data-category="CUSTOM" id="chipCatCustom" style="display: none;">自定义</button>
+      </div>
+
       <div class="slider-control">
         <label for="sliderMinWidth">
           <span>最小宽度</span>
-          <span class="slider-val" id="valMinWidth">200 px</span>
+          <span class="slider-val" id="valMinWidth">0 px</span>
         </label>
-        <input type="range" id="sliderMinWidth" min="0" max="2000" step="50" value="200">
+        <input type="range" id="sliderMinWidth" min="0" max="2000" step="50" value="0">
       </div>
 
       <div class="slider-control">
         <label for="sliderMinHeight">
           <span>最小高度</span>
-          <span class="slider-val" id="valMinHeight">200 px</span>
+          <span class="slider-val" id="valMinHeight">0 px</span>
         </label>
-        <input type="range" id="sliderMinHeight" min="0" max="2000" step="50" value="200">
+        <input type="range" id="sliderMinHeight" min="0" max="2000" step="50" value="0">
       </div>
 
       <!-- 图片格式过滤 -->
@@ -118,14 +128,25 @@
       <div class="quick-select-btns">
         <button id="btnSelectAll" class="btn-secondary" title="全选当前可见图片">全选</button>
         <button id="btnInvertSelect" class="btn-secondary" title="反向勾选可见图片">反选</button>
-        <button id="btnSelectLarge" class="btn-secondary" title="仅勾选宽度或高度 > 800px 的高清大图">仅选大图</button>
+        <button id="btnSelectLarge" class="btn-secondary" title="仅勾选长边至少 1000px 的高清大图">仅选大图</button>
         <button id="btnClearSelect" class="btn-secondary" title="取消所有勾选">清空</button>
       </div>
 
       <!-- 选中统计看板 -->
       <div class="selection-summary">
+        <span class="stat-item" id="statCollectedWrapper">
+          已采集：<strong id="statCollectedCount">0</strong> 张
+        </span>
+        <span class="stat-divider">|</span>
         <span class="stat-item">
-          已勾选：<strong id="statSelectedCount">0</strong> / <span id="statVisibleCount">0</span> 张
+          当前显示：<strong id="statVisibleCount">0</strong> 张
+        </span>
+        <span class="stat-divider">|</span>
+        <span class="stat-item">
+          已勾选：<strong id="statSelectedCount">0</strong> 张
+        </span>
+        <span class="hidden-selected-notice hidden" id="hiddenSelectedNotice">
+          （其中 <span id="statHiddenSelectedCount">0</span> 张未在当前筛选中显示）
         </span>
         <span class="stat-divider">|</span>
         <span class="stat-item">
@@ -171,7 +192,7 @@
     <!-- 空数据占位图 -->
     <div id="emptyState" class="empty-state hidden">
       <div class="empty-icon">🖼️</div>
-      <h3>暂无符合条件的图片</h3>
+      <h3 id="emptyTitle">暂无符合条件的图片</h3>
       <p id="emptySubtext">请尝试降低滑块过滤阈值，或者切换至包含丰富图片的网页再次抓取。</p>
     </div>
 
