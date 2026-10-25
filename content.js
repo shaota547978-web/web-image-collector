@@ -599,135 +599,6 @@
     return finalResults;
   }
 
-  /**
-   * 动态滚动采集器：支持在原网页持续滚动、增量发现并去重
-   * 严格受控：设置合理的滚动次数上限 (默认 8，最大 15)、图片数量上限 (100) 与时间上限 (30s)
-   */
-  const dynamicCollector = {
-    isRunning: false,
-    shouldStop: false,
-    seenUrls: new Set(),
-
-    async start(options = {}, onProgress) {
-      if (this.isRunning) {
-        return { success: false, error: '动态采集正在进行中' };
-      }
-      this.isRunning = true;
-      this.shouldStop = false;
-
-      const maxScrolls = Math.min(Math.max(options.maxScrolls || 8, 1), 15);
-      const maxImages = Math.min(Math.max(options.maxImages || 100, 10), 200);
-      const intervalMs = Math.min(Math.max(options.intervalMs || 1200, 600), 3000);
-      const maxTimeMs = 30000; // 30秒硬上限防失控
-      const startTime = Date.now();
-
-      // 初始化已见过的 URL (由画廊传入当前已有的全部图片地址，防止重复加入)
-      if (Array.isArray(options.existingUrls)) {
-        options.existingUrls.forEach(u => {
-          if (u) this.seenUrls.add(u);
-        });
-      }
-
-      let totalNewFound = 0;
-      let lastScrollY = -1;
-      let bottomHitCount = 0;
-
-      // 阶段 1：先对当前已渲染 DOM 做一次即时采集（捕获用户手动滚动后已加载的内容）
-      const initialImages = await collectImagesFromPage();
-      const initialNew = [];
-      for (const img of initialImages) {
-        if (!this.seenUrls.has(img.url)) {
-          this.seenUrls.add(img.url);
-          initialNew.push(img);
-        }
-      }
-      if (initialNew.length > 0) {
-        totalNewFound += initialNew.length;
-        if (typeof onProgress === 'function') {
-          onProgress({
-            scrollIndex: 0,
-            maxScrolls,
-            newImages: initialNew,
-            totalNew: totalNewFound,
-            isDone: false
-          });
-        }
-      }
-
-      // 阶段 2：动态滚动循环
-      for (let scrollIdx = 1; scrollIdx <= maxScrolls; scrollIdx++) {
-        if (this.shouldStop) break;
-        if (Date.now() - startTime >= maxTimeMs) break;
-        if (totalNewFound >= maxImages) break;
-
-        // 向下平滑滚动约 85% 视口高度
-        const scrollStep = Math.max(Math.floor(window.innerHeight * 0.85), 600);
-        window.scrollBy({ top: scrollStep, behavior: 'smooth' });
-
-        // 响应式等待：支持在等待期间及时响应停止指令
-        const waitSlice = 100;
-        let waited = 0;
-        while (waited < intervalMs && !this.shouldStop) {
-          await new Promise(r => setTimeout(r, waitSlice));
-          waited += waitSlice;
-        }
-
-        if (this.shouldStop) break;
-
-        // 触底检测：若连续 2 次滚动高度无变化，说明到达页面底部
-        const currentScrollY = window.scrollY || window.pageYOffset || (document.documentElement && document.documentElement.scrollTop) || 0;
-        const maxScrollable = ((document.documentElement && document.documentElement.scrollHeight) || document.body.scrollHeight) - window.innerHeight;
-        if (currentScrollY >= maxScrollable - 30 || currentScrollY === lastScrollY) {
-          bottomHitCount++;
-          if (bottomHitCount >= 2) break;
-        } else {
-          bottomHitCount = 0;
-        }
-        lastScrollY = currentScrollY;
-
-        // 嗅探新加载的 DOM 图片
-        const currentImages = await collectImagesFromPage();
-        const batchNew = [];
-        for (const img of currentImages) {
-          if (!this.seenUrls.has(img.url)) {
-            this.seenUrls.add(img.url);
-            batchNew.push(img);
-          }
-        }
-
-        if (batchNew.length > 0) {
-          totalNewFound += batchNew.length;
-        }
-
-        if (typeof onProgress === 'function') {
-          onProgress({
-            scrollIndex: scrollIdx,
-            maxScrolls,
-            newImages: batchNew,
-            totalNew: totalNewFound,
-            isDone: scrollIdx === maxScrolls || totalNewFound >= maxImages
-          });
-        }
-      }
-
-      const stoppedByUser = this.shouldStop;
-      this.isRunning = false;
-      this.shouldStop = false;
-
-      return {
-        success: true,
-        totalNew: totalNewFound,
-        stoppedByUser
-      };
-    },
-
-    stop() {
-      if (this.isRunning) {
-        this.shouldStop = true;
-      }
-    }
-  };
-
   // 监听来自 Background 与 Gallery 的采集指令
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (!request || !request.action) return false;
@@ -752,36 +623,10 @@
       return true; // 保持异步消息通道有效
     }
 
-    if (request.action === 'START_DYNAMIC_COLLECT') {
-      (async () => {
-        try {
-          const result = await dynamicCollector.start(request.options || {}, (progress) => {
-            chrome.runtime.sendMessage({
-              action: 'DYNAMIC_COLLECT_PROGRESS',
-              ...progress
-            }).catch(() => {});
-          });
-          sendResponse(result);
-        } catch (err) {
-          sendResponse({
-            success: false,
-            error: err.message
-          });
-        }
-      })();
-      return true;
-    }
-
-    if (request.action === 'STOP_DYNAMIC_COLLECT') {
-      dynamicCollector.stop();
-      sendResponse({ success: true, message: '已停止动态采集' });
-      return true;
-    }
-
     return false;
   });
 
-  // 全局暴露嗅探与动态采集方法供 executeScript 直接调度
+  // 全局暴露嗅探方法供 executeScript 直接调度
   window.__webImageCollectorSniff = collectImagesFromPage;
-  window.__webImageCollectorDynamic = dynamicCollector;
 })();
+

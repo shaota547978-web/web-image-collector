@@ -57,20 +57,16 @@
         <span class="deep-badge" id="deepGrabBadge">0</span>
       </button>
 
-      <!-- 动态继续采集控制组 -->
+      <!-- 刷新图片控制组 -->
       <div class="dynamic-collect-wrapper" id="dynamicCollectWrapper">
-        <button id="btnContinueCollect" class="btn-collect-action" title="在原网页继续滚动并自动抓取新图片">
+        <button id="btnRefreshImages" class="btn-collect-action" title="重新扫描原网页已加载的新图片">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="23 4 23 10 17 10"></polyline>
             <polyline points="1 20 1 14 7 14"></polyline>
             <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
           </svg>
-          <span id="continueCollectText">继续采集</span>
+          <span id="refreshImagesText">刷新图片</span>
           <span class="collect-count-badge hidden" id="collectCountBadge">+0</span>
-        </button>
-        <button id="btnStopCollect" class="btn-stop-action hidden" title="停止动态滚动采集">
-          <span class="stop-icon">⏹</span>
-          <span>停止</span>
         </button>
       </div>
 
@@ -151,14 +147,6 @@
     <button class="alert-close" id="btnAlertClose">&times;</button>
   </div>
 
-  <!-- 动态采集状态进度条 (继续采集运行时展示) -->
-  <div id="collectProgressBanner" class="collect-progress-banner hidden">
-    <div class="collect-progress-content">
-      <div class="collect-spinner"></div>
-      <span class="collect-progress-text" id="collectProgressText">正在原网页滚动加载更多图片...</span>
-    </div>
-    <button class="btn-stop-sm" id="btnStopCollectBanner">停止采集</button>
-  </div>
 
   <!-- 主体画廊容器 -->
   <main class="gallery-container">

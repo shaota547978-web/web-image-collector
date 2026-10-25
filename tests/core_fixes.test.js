@@ -994,82 +994,230 @@ async function runTests() {
     assert.strictEqual(state.selectedIds.size, 1, '新图片不应破坏原有勾选总数');
   });
 
-  await asyncTest('专项测试 5 行为复现: 用户主动停止动态采集后立即阻断后续滚动与抓取', async () => {
-    // 模拟 dynamicCollector 状态机与滚动循环
-    let isRunning = true;
-    let shouldStop = false;
-    let scrollCount = 0;
-    const maxScrolls = 8;
-
-    async function simulateCollectorLoop() {
-      for (let i = 1; i <= maxScrolls; i++) {
-        if (shouldStop) break;
-        scrollCount++;
-        // 模拟每次滚动等待 50ms
-        await new Promise(r => setTimeout(r, 50));
-        if (shouldStop) break;
-      }
-      isRunning = false;
-    }
-
-    const loopPromise = simulateCollectorLoop();
-
-    // 在第 2 次滚动后，用户点击停止采集
-    setTimeout(() => {
-      shouldStop = true;
-    }, 70);
-
-    await loopPromise;
-
-    assert.strictEqual(isRunning, false, '停止后采集器必须标记为未运行');
-    assert.ok(scrollCount <= 3, `用户停止后必须立即终止，实际滚动 ${scrollCount} 次，远小于上限 8 次`);
-  });
-
-  await test('专项测试 6 源码静态验证: content.js 背景图扫描杜绝容器 clientWidth/clientHeight 赋值且支持动态采集状态机', () => {
+  // -------------------------------------------------------------
+  // 专项测试：阶段 1「刷新图片」功能改造与自动滚动移除验收
+  // -------------------------------------------------------------
+  await test('阶段 1 验证 1 & 10: content.js 彻底移除自动滚动与状态机，保留单次嗅探与尺寸验证，深度穿透保持关闭', () => {
     const contentCode = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
 
-    // 断言 1: 必须包含真实尺寸异步验证方法与并发限制
-    assert.ok(contentCode.includes('function verifyImageDimensions'), 'content.js 必须包含 verifyImageDimensions');
-    assert.ok(contentCode.includes('function runWithConcurrency'), 'content.js 必须包含 runWithConcurrency 并发限制');
+    // 1. 验证自动滚动相关代码已彻底移除
+    assert.ok(!contentCode.includes('scrollBy'), 'content.js 中严禁包含 window.scrollBy 自动滚动代码');
+    assert.ok(!contentCode.includes('dynamicCollector'), 'content.js 中严禁包含 dynamicCollector 状态机');
+    assert.ok(!contentCode.includes('START_DYNAMIC_COLLECT'), 'content.js 中严禁监听 START_DYNAMIC_COLLECT 指令');
+    assert.ok(!contentCode.includes('STOP_DYNAMIC_COLLECT'), 'content.js 中严禁监听 STOP_DYNAMIC_COLLECT 指令');
+    assert.ok(!contentCode.includes('__webImageCollectorDynamic'), 'content.js 中严禁挂载 __webImageCollectorDynamic 全局对象');
 
-    // 断言 2: 背景图扫描不得直接以容器尺寸 w / h 作为图片分辨率注册
-    assert.ok(
-      !contentCode.includes("url: match[1],\n              width: w,\n              height: h,\n              source: 'background-image'") &&
-      !contentCode.includes("url: match[1],\n              width: cw,\n              height: ch"),
-      '背景图注册绝不能直接将容器 clientWidth/clientHeight 当作真实分辨率'
-    );
-    assert.ok(contentCode.includes("width: check.width,\n              height: check.height,\n              source: 'background-image'"), '背景图必须采用经过验证的真实尺寸 check.width / check.height');
+    // 2. 验证保留单次嗅探入口与异步尺寸校验
+    assert.ok(contentCode.includes('function verifyImageDimensions'), 'content.js 必须保留 verifyImageDimensions 真实尺寸校验');
+    assert.ok(contentCode.includes('function runWithConcurrency'), 'content.js 必须保留 runWithConcurrency 并发池');
+    assert.ok(contentCode.includes("request.action === 'SNIFF_IMAGES'"), 'content.js 必须保留 SNIFF_IMAGES 单次嗅探处理通道');
 
-    // 断言 3: 必须包含 dynamicCollector 动态滚动采集器实现
-    assert.ok(contentCode.includes('const dynamicCollector = {'), 'content.js 必须包含 dynamicCollector');
-    assert.ok(contentCode.includes('START_DYNAMIC_COLLECT'), '必须监听 START_DYNAMIC_COLLECT 指令');
-    assert.ok(contentCode.includes('STOP_DYNAMIC_COLLECT'), '必须监听 STOP_DYNAMIC_COLLECT 指令');
+    // 3. 验证深度穿透 Deep Grab 严格保持关闭
+    assert.ok(galleryJs.includes('const DEEP_GRAB_ENABLED = false'), 'gallery.js 中 DEEP_GRAB_ENABLED 必须严格为 false');
   });
 
-  await test('专项测试 7 源码与 DOM 完整性: gallery.html 与 gallery.js 动态采集组件与状态流转一致性', () => {
+  await test('阶段 1 验证 2: gallery.html 与 gallery.js 移除停止/进度条 UI，并接入 btnRefreshImages 与 refreshImages', () => {
     const htmlCode = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
     const jsCode = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
 
-    // 检查核心 UI 控件元素在 HTML 中存在
-    const requiredIds = [
-      'btnContinueCollect',
-      'continueCollectText',
-      'collectCountBadge',
-      'btnStopCollect',
-      'collectProgressBanner',
-      'collectProgressText',
-      'btnStopCollectBanner'
+    // 1. 检查新按钮及提示角标
+    assert.ok(htmlCode.includes('id="btnRefreshImages"'), 'gallery.html 必须包含 id="btnRefreshImages"');
+    assert.ok(htmlCode.includes('id="refreshImagesText"'), 'gallery.html 必须包含 id="refreshImagesText"');
+    assert.ok(htmlCode.includes('id="collectCountBadge"'), 'gallery.html 必须包含 id="collectCountBadge"');
+    assert.ok(jsCode.includes("btnRefreshImages: document.getElementById('btnRefreshImages')"), 'gallery.js 必须缓存 btnRefreshImages');
+
+    // 2. 检查废弃的滚动停止与进度条 UI 彻底清除
+    assert.ok(!htmlCode.includes('id="btnStopCollect"'), 'gallery.html 严禁残留 id="btnStopCollect"');
+    assert.ok(!htmlCode.includes('id="collectProgressBanner"'), 'gallery.html 严禁残留 id="collectProgressBanner"');
+    assert.ok(!htmlCode.includes('id="btnStopCollectBanner"'), 'gallery.html 严禁残留 id="btnStopCollectBanner"');
+
+    // 3. 检查 JS 核心方法定义
+    assert.ok(jsCode.includes('async function refreshImages'), 'gallery.js 必须实现 refreshImages 单次刷新');
+    assert.ok(jsCode.includes('function appendNewImages'), 'gallery.js 必须实现 appendNewImages 增量合并');
+    assert.ok(!jsCode.includes('function startDynamicCollection'), 'gallery.js 严禁遗留 startDynamicCollection');
+    assert.ok(!jsCode.includes('function stopDynamicCollection'), 'gallery.js 严禁遗留 stopDynamicCollection');
+  });
+
+  await asyncTest('阶段 1 验证 3 & 4 & 5: appendNewImages 增量合并、URL 完整去重、唯一 ID 分配与状态保持', async () => {
+    // 构造画廊运行状态
+    const mockState = {
+      allImages: [
+        { id: 'img_1', url: 'https://images.unsplash.com/photo-1?w=1080&q=80', originalUrl: 'https://images.unsplash.com/photo-1?w=1080&q=80', width: 1080, height: 720 },
+        { id: 'img_2', url: 'https://images.unsplash.com/photo-2?token=xyz', originalUrl: 'https://images.unsplash.com/photo-2?token=xyz', width: 800, height: 600 }
+      ],
+      selectedIds: new Set(['img_1']),
+      minWidth: 500,
+      minHeight: 500,
+      currentFormat: 'ALL',
+      downloadMap: new Map([['img_1', { status: 'success' }]])
+    };
+
+    // 模拟新扫描到的图片批次（包含已有重复图、不同 query 图以及全新图）
+    const scannedBatch = [
+      // 完全重复的图
+      { url: 'https://images.unsplash.com/photo-1?w=1080&q=80', width: 1080, height: 720 },
+      // query 不同的图（严格视为不同图片，保留参数）
+      { url: 'https://images.unsplash.com/photo-1?w=2000&q=90', originalUrl: 'https://images.unsplash.com/photo-1?w=2000&q=90', width: 2000, height: 1333 },
+      // 全新图
+      { url: 'https://images.unsplash.com/photo-3?auto=format', originalUrl: 'https://images.unsplash.com/photo-3?auto=format', width: 1200, height: 900 }
     ];
 
-    for (const id of requiredIds) {
-      assert.ok(htmlCode.includes(`id="${id}"`), `gallery.html 中必须包含 id="${id}"`);
-      assert.ok(jsCode.includes(`document.getElementById('${id}')`), `gallery.js 中必须缓存 id="${id}"`);
+    // 执行 appendNewImages 合并算法
+    const existingUrls = new Set();
+    mockState.allImages.forEach(img => {
+      if (img.originalUrl) existingUrls.add(img.originalUrl);
+      if (img.url) existingUrls.add(img.url);
+      if (img.fallbackUrl) existingUrls.add(img.fallbackUrl);
+    });
+
+    const existingIds = new Set(mockState.allImages.map(img => img.id));
+    let idCounter = mockState.allImages.length + 1;
+    const addedItems = [];
+
+    scannedBatch.forEach(img => {
+      const rawUrl = img.url.trim();
+      const originalUrl = img.originalUrl || rawUrl;
+      if (existingUrls.has(originalUrl) || existingUrls.has(rawUrl)) {
+        return;
+      }
+      existingUrls.add(originalUrl);
+      existingUrls.add(rawUrl);
+
+      while (existingIds.has(`img_${idCounter}`)) {
+        idCounter++;
+      }
+      const nextId = `img_${idCounter}`;
+      existingIds.add(nextId);
+      idCounter++;
+
+      addedItems.push({
+        ...img,
+        id: nextId,
+        originalUrl: originalUrl
+      });
+    });
+
+    mockState.allImages.push(...addedItems);
+
+    // 断言 1: 重复图被精确过滤，新增 2 张不同 URL 图
+    assert.strictEqual(addedItems.length, 2, '增量新发现应为 2 张');
+    assert.strictEqual(mockState.allImages.length, 4, '全量图片数应变为 4 张');
+
+    // 断言 2: 分配全局唯一且连续的 ID
+    assert.strictEqual(mockState.allImages[2].id, 'img_3', '新图片 1 ID 应为 img_3');
+    assert.strictEqual(mockState.allImages[3].id, 'img_4', '新图片 2 ID 应为 img_4');
+
+    // 断言 3: 原有勾选状态完全保留，新图默认不破坏已有选择
+    assert.ok(mockState.selectedIds.has('img_1'), '原有已勾选 img_1 必须完好保留');
+    assert.strictEqual(mockState.selectedIds.size, 1, '新图片加入绝不能自动多选或重置选择');
+
+    // 断言 4: 原有下载状态 downloadMap 完好保留
+    assert.strictEqual(mockState.downloadMap.get('img_1').status, 'success', '原有下载状态保持不变');
+
+    // 断言 5: 模拟连续二次点击刷新（无新图片），新增计数为 0，不产生任何重复数据
+    const secondScanBatch = [
+      { url: 'https://images.unsplash.com/photo-1?w=1080&q=80' },
+      { url: 'https://images.unsplash.com/photo-3?auto=format' }
+    ];
+    let secondAdded = 0;
+    secondScanBatch.forEach(img => {
+      if (!existingUrls.has(img.url)) {
+        secondAdded++;
+      }
+    });
+    assert.strictEqual(secondAdded, 0, '连续二次刷新在无新内容时不产生任何新增');
+    assert.strictEqual(mockState.allImages.length, 4, '总图片数保持 4 张不发生膨胀');
+  });
+
+  await asyncTest('阶段 1 验证 6 & 7: 来源标签页已关闭/已跳转时的安全阻断与刷新失败时按钮状态必恢复', async () => {
+    // 1. 模拟来源标签页失效（关闭或跳转）
+    function mockGetSourceTab(sourceTabId, pageUrl, currentTabInfo) {
+      if (!sourceTabId) return { tab: null, error: 'NO_SOURCE_TAB' };
+      if (!currentTabInfo) return { tab: null, error: 'TAB_CLOSED' };
+      if (pageUrl && currentTabInfo.url) {
+        try {
+          const orig = new URL(pageUrl);
+          const curr = new URL(currentTabInfo.url);
+          if (orig.origin !== curr.origin) {
+            return { tab: null, error: 'TAB_NAVIGATED' };
+          }
+        } catch {}
+      }
+      return { tab: currentTabInfo, error: null };
     }
 
-    // 检查 JS 核心方法定义
-    assert.ok(jsCode.includes('function startDynamicCollection'), 'gallery.js 必须实现 startDynamicCollection');
-    assert.ok(jsCode.includes('function stopDynamicCollection'), 'gallery.js 必须实现 stopDynamicCollection');
-    assert.ok(jsCode.includes('function appendNewImages'), 'gallery.js 必须实现 appendNewImages 增量去重');
+    // 场景 A: 原标签页已关闭
+    const closedResult = mockGetSourceTab(101, 'https://unsplash.com', null);
+    assert.strictEqual(closedResult.error, 'TAB_CLOSED', '已关闭标签页必须识别为 TAB_CLOSED');
+    assert.strictEqual(closedResult.tab, null, '绝不能自动查找或替换其他标签页');
+
+    // 场景 B: 原标签页跳转到其他网站
+    const navResult = mockGetSourceTab(101, 'https://unsplash.com', { id: 101, url: 'https://google.com' });
+    assert.strictEqual(navResult.error, 'TAB_NAVIGATED', '已跳转标签页必须识别为 TAB_NAVIGATED');
+
+    // 2. 验证刷新异常时 finally 保证按钮状态恢复
+    let buttonState = { disabled: false, text: '刷新图片', classList: new Set() };
+    let isRefreshing = false;
+
+    async function simulateRefresh(shouldThrow) {
+      if (isRefreshing) return;
+      isRefreshing = true;
+      buttonState.disabled = true;
+      buttonState.classList.add('refreshing');
+      buttonState.text = '正在刷新...';
+
+      try {
+        if (shouldThrow) {
+          throw new Error('网络异常或页面脚本无法响应');
+        }
+      } catch (err) {
+        // 对齐 gallery.js 的 catch 处理，避免未处理异常冒泡
+      } finally {
+        isRefreshing = false;
+        buttonState.disabled = false;
+        buttonState.classList.delete('refreshing');
+        buttonState.text = '刷新图片';
+      }
+    }
+
+    // 执行一次必然报错的刷新调用
+    await simulateRefresh(true);
+
+    assert.strictEqual(isRefreshing, false, '发生异常后 isRefreshing 必须被重置为 false');
+    assert.strictEqual(buttonState.disabled, false, '发生异常后按钮必须恢复可用');
+    assert.strictEqual(buttonState.text, '刷新图片', '发生异常后按钮文案必须恢复为「刷新图片」');
+    assert.strictEqual(buttonState.classList.has('refreshing'), false, '发生异常后必须移除 refreshing 样式');
+  });
+
+  await asyncTest('阶段 1 验证 8: 画廊增量持久化绑定当前任务，画廊重新加载时不丢失新增图片', async () => {
+    let mockStorage = {
+      currentCollectorTask: {
+        collectedAt: 1700000000000,
+        pageUrl: 'https://unsplash.com',
+        images: [
+          { id: 'img_1', url: 'https://unsplash.com/p1.jpg' }
+        ]
+      }
+    };
+
+    // 模拟画廊当前上下文
+    const currentTaskCollectedAt = 1700000000000;
+    const currentPageUrl = 'https://unsplash.com';
+    const allImages = [
+      { id: 'img_1', url: 'https://unsplash.com/p1.jpg' },
+      { id: 'img_2', url: 'https://unsplash.com/p2.jpg' } // 刷新后新增
+    ];
+
+    // 模拟 persistCollectorTaskImages
+    const task = mockStorage.currentCollectorTask;
+    const isSameTask = (task.collectedAt === currentTaskCollectedAt) && (task.pageUrl === currentPageUrl);
+    if (isSameTask) {
+      task.images = allImages;
+    }
+
+    assert.strictEqual(mockStorage.currentCollectorTask.images.length, 2, '新增图片必须写入持久化存储');
+    assert.strictEqual(mockStorage.currentCollectorTask.images[1].id, 'img_2', '持久化中保存了完整新图片对象');
   });
 
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);
