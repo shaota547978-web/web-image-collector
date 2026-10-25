@@ -312,6 +312,19 @@
    */
   async function collectImagesFromPage(taskId = null) {
     const t0 = performance.now();
+
+    // 阶段 3 优化：向画廊发送第一阶段（图片发现阶段）进度通知
+    if (taskId) {
+      try {
+        chrome.runtime.sendMessage({
+          action: 'SNIFF_PROGRESS',
+          taskId: taskId,
+          phase: 'discovering',
+          text: '正在发现网页图片…'
+        }).catch(() => {});
+      } catch {}
+    }
+
     // 跨节点的去重逻辑：安全基准，仅当【完整 URL 字符串完全相同】时执行去重
     const candidateMap = new Map(); // targetUrl -> ImageCandidate
 
@@ -552,7 +565,24 @@
 
     // 5.3 统一并发执行（安全并发数 10，超时 1200ms，杜绝拖慢原网页）
     let verifiedCount = 0;
-    if (verificationTasks.length > 0) {
+    const totalVerificationTasks = verificationTasks.length;
+
+    // 阶段 3 优化：向画廊发送第二阶段（尺寸校验阶段开始）进度通知
+    if (taskId && totalVerificationTasks > 0) {
+      try {
+        chrome.runtime.sendMessage({
+          action: 'SNIFF_PROGRESS',
+          taskId: taskId,
+          phase: 'verifying',
+          candidateCount: candidateMap.size,
+          processed: 0,
+          total: totalVerificationTasks,
+          percent: 0
+        }).catch(() => {});
+      } catch {}
+    }
+
+    if (totalVerificationTasks > 0) {
       await runWithConcurrency(verificationTasks, 10, async (task) => {
         try {
           const check = await verifyImageDimensions(task.url, 1200);
@@ -586,13 +616,21 @@
           // 校验失败保留原有 0 宽高，由画廊显示「未知尺寸」
         } finally {
           verifiedCount++;
-          // 向画廊实时通知真实识别进度（杜绝假进度条）
-          if (taskId && (verifiedCount % 6 === 0 || verifiedCount === verificationTasks.length)) {
+          // 向画廊实时通知真实校验进度（控频：每处理 4 个或最后一个时发送，杜绝频繁消息拖慢）
+          // 超时或失败计入 verifiedCount 已处理，但不篡改候选图分辨率
+          if (taskId && (verifiedCount % 4 === 0 || verifiedCount === totalVerificationTasks)) {
             try {
+              const percent = totalVerificationTasks > 0
+                ? Math.min(100, Math.floor((verifiedCount / totalVerificationTasks) * 100))
+                : 100;
               chrome.runtime.sendMessage({
                 action: 'SNIFF_PROGRESS',
                 taskId: taskId,
-                count: candidateMap.size
+                phase: 'verifying',
+                candidateCount: candidateMap.size,
+                processed: verifiedCount,
+                total: totalVerificationTasks,
+                percent: percent
               }).catch(() => {});
             } catch {}
           }
@@ -601,6 +639,19 @@
     }
 
     const t3 = performance.now();
+
+    // 阶段 3 优化：向画廊发送第三阶段（整理阶段）进度通知
+    if (taskId) {
+      try {
+        chrome.runtime.sendMessage({
+          action: 'SNIFF_PROGRESS',
+          taskId: taskId,
+          phase: 'organizing',
+          candidateCount: candidateMap.size,
+          text: '正在整理图片结果…'
+        }).catch(() => {});
+      } catch {}
+    }
 
     // 打印真实耗时分析（定位耗时环节）
     console.log(`[Web Image Collector Perf] 任务 ${taskId || 'default'} 耗时分析:

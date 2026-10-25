@@ -280,7 +280,7 @@ body.dark-theme {
 }
 
 /* ==========================================================================
-   Toolbar Section (Filters & Batch Actions)
+   Toolbar Section (Filters & Batch Actions) - 3 Group Layout
    ========================================================================== */
 
 .toolbar-section {
@@ -288,17 +288,61 @@ body.dark-theme {
   border-bottom: 1px solid var(--border-subtle);
   padding: 14px 24px;
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* 顶部筛选行：第一组（尺寸分类）与第二组（图片格式） */
+.toolbar-filters-row {
+  display: flex;
   align-items: center;
-  justify-content: space-between;
+  flex-wrap: wrap;
   gap: 16px;
 }
 
-.filter-group {
+.toolbar-group {
   display: flex;
   align-items: center;
-  gap: 24px;
+  gap: 10px;
   flex-wrap: wrap;
+}
+
+.group-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--border-subtle);
+  margin: 0 4px;
+}
+
+/* 自定义尺寸滑块面板（进入自定义尺寸时展开） */
+.custom-slider-panel {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  border-radius: var(--radius-md);
+  padding: 10px 18px;
+  flex-wrap: wrap;
+  animation: fadeInState 0.2s ease-out;
+}
+
+.custom-slider-panel.hidden {
+  display: none !important;
+}
+
+.custom-slider-tip {
+  font-size: 12px;
+  color: var(--text-muted);
+  opacity: 0.8;
 }
 
 .slider-control {
@@ -359,7 +403,7 @@ body.dark-theme {
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid var(--border-subtle);
   color: var(--text-muted);
-  padding: 4px 10px;
+  padding: 5px 12px;
   border-radius: var(--radius-sm);
   font-size: 12px;
   font-weight: 500;
@@ -393,17 +437,21 @@ body.dark-theme {
   color: #c7d2fe;
 }
 
-/* 快捷按钮与统计 */
-.action-group {
+/* 第三组：图片操作与统计行 */
+.toolbar-actions-row {
   display: flex;
   align-items: center;
-  gap: 20px;
+  justify-content: space-between;
+  gap: 16px;
   flex-wrap: wrap;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .quick-select-btns {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .btn-secondary {
@@ -428,6 +476,7 @@ body.dark-theme {
   gap: 12px;
   font-size: 13px;
   color: var(--text-muted);
+  flex-wrap: wrap;
 }
 
 .stat-item strong {
@@ -564,6 +613,40 @@ body.dark-theme {
   line-height: 1.6;
   max-width: 440px;
   margin-bottom: 16px;
+}
+
+.collector-loading-bar-wrapper {
+  width: 100%;
+  max-width: 360px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  margin: 4px 0 16px;
+  position: relative;
+}
+
+.collector-loading-bar-wrapper.hidden {
+  display: none !important;
+}
+
+.collector-loading-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #6366f1, #38bdf8);
+  border-radius: var(--radius-full);
+  transition: width 0.25s ease-out;
+}
+
+.collector-loading-bar-wrapper.indeterminate .collector-loading-bar-fill {
+  width: 40% !important;
+  animation: indeterminateBar 1.4s ease-in-out infinite;
+}
+
+@keyframes indeterminateBar {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(120%); }
+  100% { transform: translateX(300%); }
 }
 
 .collector-loading-counter {
@@ -1424,17 +1507,65 @@ body.dark-theme {
     flex-direction: column;
     align-items: flex-start;
     gap: 12px;
+    padding: 12px 16px;
+  }
+  .header-left {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
   }
   .header-right {
     width: 100%;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
   }
   .source-capsule {
-    max-width: 240px;
+    max-width: 220px;
   }
   .toolbar-section {
+    padding: 12px 16px;
+    gap: 12px;
+  }
+  .toolbar-filters-row {
     flex-direction: column;
     align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+  }
+  .toolbar-divider {
+    display: none;
+  }
+  .toolbar-group {
+    width: 100%;
+    gap: 8px;
+  }
+  .custom-slider-panel {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 10px 14px;
+    box-sizing: border-box;
+  }
+  .custom-slider-panel .slider-control {
+    width: 100%;
+  }
+  .toolbar-actions-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+    width: 100%;
+  }
+  .quick-select-btns {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .selection-summary {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
   }
   .bottom-console {
     width: 95%;

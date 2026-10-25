@@ -16,6 +16,8 @@
     isPro: false,            // 是否激活 Pro License
     proLimit: 20,            // 免费版单次最大允许勾选数量
     sizeCategory: 'LARGE',   // 阶段 3 默认选中「大图」: 'ALL' | 'LARGE' | 'MEDIUM' | 'SMALL' | 'UNKNOWN' | 'CUSTOM'
+    customMinWidth: 200,     // 自定义最小宽度预设与记忆值
+    customMinHeight: 200,    // 自定义最小高度预设与记忆值
     minWidth: 0,             // 自定义最小宽度门槛 (CUSTOM 模式生效)
     minHeight: 0,            // 自定义最小高度门槛 (CUSTOM 模式生效)
     currentFormat: 'ALL',
@@ -92,6 +94,7 @@
     chipCatUnknown: document.getElementById('chipCatUnknown'),
     countCatUnknown: document.getElementById('countCatUnknown'),
     chipCatCustom: document.getElementById('chipCatCustom'),
+    customSliderPanel: document.getElementById('customSliderPanel'),
 
     sliderMinWidth: document.getElementById('sliderMinWidth'),
     sliderMinHeight: document.getElementById('sliderMinHeight'),
@@ -125,6 +128,8 @@
     loadingState: document.getElementById('loadingState'),
     loadingStateTitle: document.getElementById('loadingStateTitle'),
     loadingStateSubtext: document.getElementById('loadingStateSubtext'),
+    loadingBarWrapper: document.getElementById('loadingBarWrapper'),
+    loadingBarFill: document.getElementById('loadingBarFill'),
     loadingProgressCounter: document.getElementById('loadingProgressCounter'),
 
     errorState: document.getElementById('errorState'),
@@ -439,6 +444,15 @@
       dom.loadingStateTitle.textContent = message;
     }
 
+    if (dom.loadingBarWrapper) {
+      dom.loadingBarWrapper.classList.remove('hidden');
+      dom.loadingBarWrapper.classList.add('indeterminate');
+      dom.loadingBarWrapper.setAttribute('aria-valuenow', '0');
+    }
+    if (dom.loadingBarFill) {
+      dom.loadingBarFill.style.width = '0%';
+    }
+
     if (count != null && count > 0 && dom.loadingProgressCounter) {
       dom.loadingProgressCounter.textContent = `已识别 ${count} 张`;
       dom.loadingProgressCounter.classList.remove('hidden');
@@ -527,7 +541,66 @@
           showErrorState(message.error || '采集失败，请重试');
         }
       } else if (message.action === 'SNIFF_PROGRESS') {
-        if (state.taskStatus === 'loading' && typeof message.count === 'number') {
+        if (state.taskStatus !== 'loading') return;
+
+        if (message.phase === 'discovering') {
+          if (dom.loadingStateTitle) dom.loadingStateTitle.textContent = message.text || '正在发现网页图片…';
+          if (dom.loadingStateSubtext) dom.loadingStateSubtext.textContent = '正在扫描页面 DOM 与样式，定位候选图片…';
+          if (dom.loadingBarWrapper) {
+            dom.loadingBarWrapper.classList.remove('hidden');
+            dom.loadingBarWrapper.classList.add('indeterminate');
+            dom.loadingBarWrapper.setAttribute('aria-valuenow', '0');
+          }
+          if (dom.loadingBarFill) {
+            dom.loadingBarFill.style.width = '0%';
+          }
+          if (dom.loadingProgressCounter) {
+            dom.loadingProgressCounter.classList.add('hidden');
+          }
+        } else if (message.phase === 'verifying') {
+          if (dom.loadingStateTitle) dom.loadingStateTitle.textContent = '正在检测真实尺寸…';
+          if (dom.loadingBarWrapper) {
+            dom.loadingBarWrapper.classList.remove('indeterminate');
+            dom.loadingBarWrapper.classList.remove('hidden');
+          }
+
+          if (typeof message.total === 'number' && message.total > 0) {
+            const processed = message.processed || 0;
+            const total = message.total;
+            const percent = Math.min(100, Math.floor((processed / total) * 100));
+            if (dom.loadingBarFill) {
+              dom.loadingBarFill.style.width = `${percent}%`;
+            }
+            if (dom.loadingBarWrapper) {
+              dom.loadingBarWrapper.setAttribute('aria-valuenow', String(percent));
+            }
+            const candidateCount = typeof message.candidateCount === 'number' ? message.candidateCount : processed;
+            if (dom.loadingStateSubtext) {
+              dom.loadingStateSubtext.textContent = `已处理 ${processed} / ${total}（已发现 ${candidateCount} 张候选图片）`;
+            }
+            if (dom.loadingProgressCounter) {
+              dom.loadingProgressCounter.textContent = `尺寸校验中 ${percent}%`;
+              dom.loadingProgressCounter.classList.remove('hidden');
+            }
+          } else {
+            if (dom.loadingBarWrapper) dom.loadingBarWrapper.classList.add('indeterminate');
+            if (dom.loadingProgressCounter) dom.loadingProgressCounter.classList.add('hidden');
+          }
+        } else if (message.phase === 'organizing') {
+          if (dom.loadingStateTitle) dom.loadingStateTitle.textContent = message.text || '正在整理图片结果…';
+          const candidateCount = typeof message.candidateCount === 'number' ? message.candidateCount : 0;
+          if (dom.loadingStateSubtext) {
+            dom.loadingStateSubtext.textContent = `已完成尺寸检测，正在生成画廊索引与预览…（共 ${candidateCount} 张）`;
+          }
+          if (dom.loadingBarWrapper) {
+            dom.loadingBarWrapper.classList.remove('hidden');
+            dom.loadingBarWrapper.classList.add('indeterminate');
+          }
+          if (dom.loadingProgressCounter) {
+            dom.loadingProgressCounter.textContent = '整理中…';
+            dom.loadingProgressCounter.classList.remove('hidden');
+          }
+        } else if (typeof message.count === 'number') {
           if (dom.loadingProgressCounter) {
             dom.loadingProgressCounter.textContent = `已识别 ${message.count} 张`;
             dom.loadingProgressCounter.classList.remove('hidden');
@@ -1305,14 +1378,23 @@
       const cat = chip.dataset.category;
       if (cat === state.sizeCategory) {
         chip.classList.add('active');
-        if (cat === 'CUSTOM') chip.style.display = 'inline-flex';
       } else {
         chip.classList.remove('active');
-        if (cat === 'CUSTOM' && state.sizeCategory !== 'CUSTOM') {
-          chip.style.display = 'none';
-        }
       }
     });
+
+    const isCustom = state.sizeCategory === 'CUSTOM';
+    if (dom.chipCatCustom) {
+      dom.chipCatCustom.setAttribute('aria-expanded', isCustom ? 'true' : 'false');
+    }
+
+    if (dom.customSliderPanel) {
+      if (isCustom) {
+        dom.customSliderPanel.classList.remove('hidden');
+      } else {
+        dom.customSliderPanel.classList.add('hidden');
+      }
+    }
   }
 
   // 阶段 3 规范：未知尺寸图片在后台进行受控异步验证，确保默认大图筛选隐藏时不丢失验证机会，且不阻塞画廊启动
@@ -3065,7 +3147,7 @@
   // 10. 事件监听器绑定
   // -------------------------------------------------------------
   function bindEvents() {
-    // 阶段 3 规范：尺寸分类 Chips 切换
+    // 阶段 3 优化：尺寸分类 Chips 切换
     if (dom.sizeCategoryChips) {
       dom.sizeCategoryChips.querySelectorAll('.chip').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -3074,57 +3156,54 @@
 
           state.sizeCategory = cat;
 
-          // 规范要求：用户重新点击任意尺寸分类时，以该分类规则为准，不受之前的自定义滑块值干扰
-          // 切换模式时正确同步滑块数值、模式标识与实际过滤结果
-          if (cat === 'ALL') {
+          // 规范要求：
+          // 1. 处于快捷分类时，不要把分类阈值写成两个滑块的独立宽高限制
+          // 2. 只有用户进入「自定义尺寸」时，才展开最小宽度和最小高度滑块
+          // 3. 自定义模式沿用现有的 AND 规则，即宽、高分别满足用户设置的最小值
+          // 4. 切回快捷分类时，收起自定义设置，分类结果不受滑块影响
+          // 5. 再次进入自定义模式时，恢复上次设置的数值
+          if (cat === 'CUSTOM') {
+            state.minWidth = state.customMinWidth;
+            state.minHeight = state.customMinHeight;
+            if (dom.sliderMinWidth) dom.sliderMinWidth.value = state.customMinWidth;
+            if (dom.sliderMinHeight) dom.sliderMinHeight.value = state.customMinHeight;
+            if (dom.valMinWidth) dom.valMinWidth.textContent = `${state.customMinWidth} px`;
+            if (dom.valMinHeight) dom.valMinHeight.textContent = `${state.customMinHeight} px`;
+          } else {
+            // 切回快捷分类时，重置运行时门槛为 0，收起滑块，分类判定依据 getImageSizeCategory，不篡改记忆值
             state.minWidth = 0;
             state.minHeight = 0;
-            dom.sliderMinWidth.value = 0;
-            dom.sliderMinHeight.value = 0;
-            dom.valMinWidth.textContent = '0 px';
-            dom.valMinHeight.textContent = '0 px';
-          } else if (cat === 'LARGE') {
-            dom.sliderMinWidth.value = 1000;
-            dom.sliderMinHeight.value = 1000;
-            dom.valMinWidth.textContent = '1000 px';
-            dom.valMinHeight.textContent = '1000 px';
-          } else if (cat === 'MEDIUM') {
-            dom.sliderMinWidth.value = 200;
-            dom.sliderMinHeight.value = 200;
-            dom.valMinWidth.textContent = '200 px';
-            dom.valMinHeight.textContent = '200 px';
-          } else if (cat === 'SMALL') {
-            dom.sliderMinWidth.value = 0;
-            dom.sliderMinHeight.value = 0;
-            dom.valMinWidth.textContent = '0 px';
-            dom.valMinHeight.textContent = '0 px';
-          } else if (cat === 'UNKNOWN') {
-            dom.sliderMinWidth.value = 0;
-            dom.sliderMinHeight.value = 0;
-            dom.valMinWidth.textContent = '0 px';
-            dom.valMinHeight.textContent = '0 px';
           }
 
+          updateSizeCategoryUI();
           applyFilters();
         });
       });
     }
 
-    // 宽度滑块：用户手动调整任一宽高滑块时，自动进入「自定义」模式
-    dom.sliderMinWidth.addEventListener('input', (e) => {
-      state.sizeCategory = 'CUSTOM';
-      state.minWidth = parseInt(e.target.value, 10) || 0;
-      dom.valMinWidth.textContent = `${state.minWidth} px`;
-      applyFilters();
-    });
+    // 宽度滑块：用户在自定义模式下调整最小宽度
+    if (dom.sliderMinWidth) {
+      dom.sliderMinWidth.addEventListener('input', (e) => {
+        state.sizeCategory = 'CUSTOM';
+        state.customMinWidth = parseInt(e.target.value, 10) || 0;
+        state.minWidth = state.customMinWidth;
+        if (dom.valMinWidth) dom.valMinWidth.textContent = `${state.customMinWidth} px`;
+        updateSizeCategoryUI();
+        applyFilters();
+      });
+    }
 
-    // 高度滑块：用户手动调整任一宽高滑块时，自动进入「自定义」模式
-    dom.sliderMinHeight.addEventListener('input', (e) => {
-      state.sizeCategory = 'CUSTOM';
-      state.minHeight = parseInt(e.target.value, 10) || 0;
-      dom.valMinHeight.textContent = `${state.minHeight} px`;
-      applyFilters();
-    });
+    // 高度滑块：用户在自定义模式下调整最小高度
+    if (dom.sliderMinHeight) {
+      dom.sliderMinHeight.addEventListener('input', (e) => {
+        state.sizeCategory = 'CUSTOM';
+        state.customMinHeight = parseInt(e.target.value, 10) || 0;
+        state.minHeight = state.customMinHeight;
+        if (dom.valMinHeight) dom.valMinHeight.textContent = `${state.customMinHeight} px`;
+        updateSizeCategoryUI();
+        applyFilters();
+      });
+    }
 
     // 格式过滤 Chips
     dom.formatChips.querySelectorAll('.chip').forEach(btn => {

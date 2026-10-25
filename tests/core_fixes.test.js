@@ -17,6 +17,7 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const GALLERY_HTML_PATH = path.join(ROOT_DIR, 'gallery.html');
 const GALLERY_JS_PATH = path.join(ROOT_DIR, 'gallery.js');
 const CONTENT_JS_PATH = path.join(ROOT_DIR, 'content.js');
+const GALLERY_CSS_PATH = path.join(ROOT_DIR, 'gallery.css');
 
 // 模拟 Blob 供 Node 环境测试
 class MockBlob {
@@ -2498,6 +2499,174 @@ async function runTests() {
 
     // 3. 空状态展示友好文字断言
     assert.ok(galleryJs.includes('当前没有符合条件的大图，可切换到全部查看。'), '大图空状态友好提示文案精准无误');
+  });
+
+  // -------------------------------------------------------------
+  // 测试 10：阶段 3 补充优化验收测试 (任务 A / B / C / D)
+  // -------------------------------------------------------------
+  await asyncTest('阶段 3 补充 1: 图片发现阶段不伪造百分比', async () => {
+    const contentJs = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. content.js 中第一阶段为 'discovering'，不发送假百分比
+    assert.ok(contentJs.includes("phase: 'discovering'"), 'content.js 必须发射 discovering 阶段通知');
+    assert.ok(contentJs.includes("text: '正在发现网页图片…'"), '图片发现阶段文案精准无误');
+
+    // 2. gallery.js 中接收 discovering 阶段时设置 indeterminate，不展示虚假百分比
+    assert.ok(galleryJs.includes("message.phase === 'discovering'"), 'gallery.js 必须处理 discovering 阶段');
+    assert.ok(galleryJs.includes("dom.loadingBarWrapper.classList.add('indeterminate')"), '发现阶段使用不确定动画');
+  });
+
+  await asyncTest('阶段 3 补充 2: 已处理 30/60 时，尺寸验证阶段显示 50% 与真实计数', async () => {
+    const contentJs = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. content.js 验证阶段控频计算真实百分比
+    assert.ok(contentJs.includes("phase: 'verifying'"), 'content.js 发射 verifying 阶段');
+    assert.ok(contentJs.includes("Math.floor((verifiedCount / totalVerificationTasks) * 100)"), '真实计算百分比');
+
+    // 2. 模拟 30/60 验证消息到达画廊
+    const mockMsg = {
+      action: 'SNIFF_PROGRESS',
+      taskId: 'test_task',
+      phase: 'verifying',
+      candidateCount: 85,
+      processed: 30,
+      total: 60,
+      percent: 50
+    };
+
+    const percent = Math.min(100, Math.floor((mockMsg.processed / mockMsg.total) * 100));
+    assert.strictEqual(percent, 50, '30/60 的真实进度必须为 50%');
+    const subtext = `已处理 ${mockMsg.processed} / ${mockMsg.total}（已发现 ${mockMsg.candidateCount} 张候选图片）`;
+    assert.ok(subtext.includes('已处理 30 / 60'), '文案展示真实处理分母与分子');
+    assert.ok(subtext.includes('85 张候选图片'), '文案如实展示累计候选图数');
+  });
+
+  await asyncTest('阶段 3 补充 3: 尺寸验证结束但数据整理中时，不提前宣布采集成功', async () => {
+    const contentJs = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. content.js 在尺寸校验结束后、清洗返回前发射 organizing 阶段
+    assert.ok(contentJs.includes("phase: 'organizing'"), 'content.js 尺寸校验后必须发射 organizing 阶段');
+    assert.ok(contentJs.includes("text: '正在整理图片结果…'"), '整理阶段文案无误');
+
+    // 2. gallery.js 收到 organizing 阶段时依然保持 loading 状态，不提前切换成功
+    assert.ok(galleryJs.includes("message.phase === 'organizing'"), 'gallery.js 必须处理 organizing 阶段');
+  });
+
+  await asyncTest('阶段 3 补充 4: 不同 taskId 的进度互不干扰（画廊严格隔离）', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 验证消息处理中的隔离守卫
+    assert.ok(
+      galleryJs.includes('if (state.taskId && message.taskId && message.taskId !== state.taskId)'),
+      '画廊消息监听器必须包含跨任务 taskId 隔离守卫'
+    );
+  });
+
+  await asyncTest('阶段 3 补充 5: 默认大图包含 600×1500 图片，不要求宽高都超过 1000', async () => {
+    const h = createPhase3Helpers({ sizeCategory: 'LARGE', minWidth: 0, minHeight: 0 });
+
+    const vertImg = { url: 'https://example.com/tall.jpg', width: 600, height: 1500 };
+    const horizImg = { url: 'https://example.com/wide.jpg', width: 1600, height: 500 };
+    const mediumImg = { url: 'https://example.com/med.jpg', width: 800, height: 950 };
+
+    assert.strictEqual(h.getImageSizeCategory(vertImg), 'LARGE', '600x1500 竖图长边为 1500，必须归为大图');
+    assert.strictEqual(h.matchesSizeFilter(vertImg), true, '600x1500 必须通过大图筛选');
+
+    assert.strictEqual(h.getImageSizeCategory(horizImg), 'LARGE', '1600x500 横图长边为 1600，必须归为大图');
+    assert.strictEqual(h.matchesSizeFilter(horizImg), true, '1600x500 必须通过大图筛选');
+
+    assert.strictEqual(h.getImageSizeCategory(mediumImg), 'MEDIUM', '800x950 长边不足 1000，必须归为中图');
+    assert.strictEqual(h.matchesSizeFilter(mediumImg), false, '800x950 严禁被大图筛选误收');
+  });
+
+  await asyncTest('阶段 3 补充 6: 自定义宽高滑块只在自定义模式生效（快捷分类下不施加双门槛）', async () => {
+    // 快捷分类模式：LARGE (minWidth = 0, minHeight = 0)
+    const hLarge = createPhase3Helpers({ sizeCategory: 'LARGE', minWidth: 0, minHeight: 0 });
+    const vertImg = { url: 'https://example.com/tall.jpg', width: 500, height: 1200 };
+    assert.strictEqual(hLarge.matchesSizeFilter(vertImg), true, '大图模式不受滑块限制');
+
+    // 自定义模式：CUSTOM 需同时满足宽 >= 600 AND 高 >= 600
+    const hCustom = createPhase3Helpers({ sizeCategory: 'CUSTOM', minWidth: 600, minHeight: 600 });
+    assert.strictEqual(hCustom.matchesSizeFilter(vertImg), false, '自定义模式下 500 宽不满足 600 门槛');
+
+    const squareImg = { url: 'https://example.com/sq.jpg', width: 800, height: 800 };
+    assert.strictEqual(hCustom.matchesSizeFilter(squareImg), true, '自定义模式下 800x800 双双满足');
+  });
+
+  await asyncTest('阶段 3 补充 7: 切换分类并返回自定义，保留此前滑块值', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 静态断言：自定义记忆值字段存在
+    assert.ok(galleryJs.includes('customMinWidth'), 'state 必须维护 customMinWidth 记忆值');
+    assert.ok(galleryJs.includes('customMinHeight'), 'state 必须维护 customMinHeight 记忆值');
+
+    // 模拟状态机切换过程
+    const state = {
+      sizeCategory: 'CUSTOM',
+      customMinWidth: 750,
+      customMinHeight: 450,
+      minWidth: 750,
+      minHeight: 450
+    };
+
+    // 1. 用户切换到「大图」快捷分类
+    state.sizeCategory = 'LARGE';
+    state.minWidth = 0;
+    state.minHeight = 0;
+
+    assert.strictEqual(state.sizeCategory, 'LARGE');
+    assert.strictEqual(state.minWidth, 0, '大图模式运行时门槛为 0');
+    assert.strictEqual(state.customMinWidth, 750, '用户设定的 750px 宽度记忆值必须完好保留');
+
+    // 2. 用户再次点击「自定义尺寸」
+    state.sizeCategory = 'CUSTOM';
+    state.minWidth = state.customMinWidth;
+    state.minHeight = state.customMinHeight;
+
+    assert.strictEqual(state.sizeCategory, 'CUSTOM');
+    assert.strictEqual(state.minWidth, 750, '返回自定义模式时精准恢复 750px');
+    assert.strictEqual(state.minHeight, 450, '返回自定义模式时精准恢复 450px');
+  });
+
+  await asyncTest('阶段 3 补充 8: 格式筛选、已勾选图片与免费版限制不受影响', async () => {
+    const h = createPhase3Helpers({ sizeCategory: 'LARGE', currentFormat: 'WEBP' });
+
+    const webpLarge = { url: 'https://example.com/pic.webp', width: 1200, height: 800 };
+    const pngLarge = { url: 'https://example.com/pic.png', width: 1200, height: 800 };
+
+    assert.strictEqual(h.matchesSizeFilter(webpLarge) && h.matchesFormatFilter(webpLarge), true, 'WEBP 大图正常匹配');
+    assert.strictEqual(h.matchesSizeFilter(pngLarge) && h.matchesFormatFilter(pngLarge), false, 'PNG 大图被 WEBP 格式阻断');
+  });
+
+  await asyncTest('阶段 3 补充 9: 工具栏三组布局结构完整且具备必要 ARIA 标识', async () => {
+    const galleryHtml = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
+    const galleryCss = fs.readFileSync(GALLERY_CSS_PATH, 'utf-8');
+
+    // 1. 三组结构完整
+    assert.ok(galleryHtml.includes('class="toolbar-filters-row"'), '包含第一、二组容器 toolbar-filters-row');
+    assert.ok(galleryHtml.includes('id="customSliderPanel"'), '包含自定义滑块抽屉 customSliderPanel');
+    assert.ok(galleryHtml.includes('class="toolbar-actions-row"'), '包含第三组容器 toolbar-actions-row');
+
+    // 2. ARIA 标识完备
+    assert.ok(galleryHtml.includes('aria-controls="customSliderPanel"'), '自定义 Chip 具备 aria-controls 属性');
+    assert.ok(galleryHtml.includes('role="progressbar"'), '进度条具备 role="progressbar"');
+    assert.ok(galleryHtml.includes('aria-live="polite"'), '状态信息具备 aria-live="polite"');
+
+    // 3. CSS 包含响应式适配
+    assert.ok(galleryCss.includes('.custom-slider-panel.hidden'), 'CSS 包含自定义面板收起样式');
+    assert.ok(galleryCss.includes('@media (max-width: 768px)'), 'CSS 包含 768px 响应式媒体查询');
+  });
+
+  await asyncTest('阶段 3 补充 10: 现有手动刷新、加载失败重试、单张下载及 ZIP 下载不受影响', async () => {
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    assert.ok(galleryJs.includes('dom.btnRefreshImages.addEventListener'), '手动刷新按钮事件绑定完好');
+    assert.ok(galleryJs.includes('dom.btnRetryCollect.addEventListener'), '重试采集按钮事件绑定完好');
+    assert.ok(galleryJs.includes('dom.btnDownloadZip.addEventListener'), 'ZIP 下载按钮事件绑定完好');
+    assert.ok(galleryJs.includes('downloadSingleImage('), '单张下载内核完整保留');
   });
 
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);

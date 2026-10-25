@@ -84,56 +84,69 @@
   </header>
 
   <!-- 次级过滤与控制面板 -->
-  <section class="toolbar-section">
-    <!-- 快捷过滤滑块 -->
-    <div class="filter-group">
-      <!-- 尺寸分类切换 -->
-      <div class="size-category-chips" id="sizeCategoryChips">
-        <button class="chip" data-category="ALL" id="chipCatAll">全部 <span class="chip-count" id="countCatAll">(0)</span></button>
-        <button class="chip active" data-category="LARGE" id="chipCatLarge">大图 <span class="chip-count" id="countCatLarge">(0)</span></button>
-        <button class="chip" data-category="MEDIUM" id="chipCatMedium">中图 <span class="chip-count" id="countCatMedium">(0)</span></button>
-        <button class="chip" data-category="SMALL" id="chipCatSmall">小图 <span class="chip-count" id="countCatSmall">(0)</span></button>
-        <button class="chip" data-category="UNKNOWN" id="chipCatUnknown">未知尺寸 <span class="chip-count" id="countCatUnknown">(0)</span></button>
-        <button class="chip" data-category="CUSTOM" id="chipCatCustom" style="display: none;">自定义</button>
+  <section class="toolbar-section" aria-label="筛选与批量操作工具栏">
+    <!-- 顶部主筛选条：第一组（尺寸分类）与第二组（图片格式） -->
+    <div class="toolbar-filters-row">
+      <!-- 第一组：尺寸分类 -->
+      <div class="toolbar-group filter-group-size" role="group" aria-label="第一组：尺寸分类">
+        <span class="group-label">尺寸分类</span>
+        <div class="size-category-chips" id="sizeCategoryChips">
+          <button class="chip" data-category="ALL" id="chipCatAll">全部 <span class="chip-count" id="countCatAll">(0)</span></button>
+          <button class="chip active" data-category="LARGE" id="chipCatLarge">大图 <span class="chip-count" id="countCatLarge">(0)</span></button>
+          <button class="chip" data-category="MEDIUM" id="chipCatMedium">中图 <span class="chip-count" id="countCatMedium">(0)</span></button>
+          <button class="chip" data-category="SMALL" id="chipCatSmall">小图 <span class="chip-count" id="countCatSmall">(0)</span></button>
+          <button class="chip" data-category="UNKNOWN" id="chipCatUnknown">未知尺寸 <span class="chip-count" id="countCatUnknown">(0)</span></button>
+          <button class="chip chip-custom-trigger" data-category="CUSTOM" id="chipCatCustom" aria-expanded="false" aria-controls="customSliderPanel">自定义尺寸</button>
+        </div>
       </div>
 
+      <div class="toolbar-divider" aria-hidden="true"></div>
+
+      <!-- 第二组：图片格式 -->
+      <div class="toolbar-group filter-group-format" role="group" aria-label="第二组：图片格式">
+        <span class="group-label">图片格式</span>
+        <div class="format-chips" id="formatChips">
+          <button class="chip active" data-format="ALL">全部格式</button>
+          <button class="chip" data-format="JPG">JPG</button>
+          <button class="chip" data-format="PNG">PNG</button>
+          <button class="chip" data-format="WEBP">WEBP</button>
+          <button class="chip" data-format="SVG">SVG</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 自定义尺寸滑块抽屉（仅在用户进入「自定义尺寸」时展开） -->
+    <div class="custom-slider-panel hidden" id="customSliderPanel" role="region" aria-label="自定义宽高滑块">
       <div class="slider-control">
         <label for="sliderMinWidth">
           <span>最小宽度</span>
-          <span class="slider-val" id="valMinWidth">0 px</span>
+          <span class="slider-val" id="valMinWidth">200 px</span>
         </label>
-        <input type="range" id="sliderMinWidth" min="0" max="2000" step="50" value="0">
+        <input type="range" id="sliderMinWidth" min="0" max="2000" step="50" value="200" aria-label="最小宽度">
       </div>
 
       <div class="slider-control">
         <label for="sliderMinHeight">
           <span>最小高度</span>
-          <span class="slider-val" id="valMinHeight">0 px</span>
+          <span class="slider-val" id="valMinHeight">200 px</span>
         </label>
-        <input type="range" id="sliderMinHeight" min="0" max="2000" step="50" value="0">
+        <input type="range" id="sliderMinHeight" min="0" max="2000" step="50" value="200" aria-label="最小高度">
       </div>
-
-      <!-- 图片格式过滤 -->
-      <div class="format-chips" id="formatChips">
-        <button class="chip active" data-format="ALL">全部格式</button>
-        <button class="chip" data-format="JPG">JPG/JPEG</button>
-        <button class="chip" data-format="PNG">PNG</button>
-        <button class="chip" data-format="WEBP">WEBP</button>
-        <button class="chip" data-format="SVG">SVG</button>
-      </div>
+      <div class="custom-slider-tip">（宽与高需同时满足）</div>
     </div>
 
-    <!-- 批量快捷勾选与统计 -->
-    <div class="action-group">
-      <div class="quick-select-btns">
+    <!-- 第三组：图片操作与统计 -->
+    <div class="toolbar-actions-row" role="group" aria-label="第三组：图片操作与统计">
+      <!-- 批量选择操作 -->
+      <div class="quick-select-btns" role="group" aria-label="批量选择">
         <button id="btnSelectAll" class="btn-secondary" title="全选当前可见图片">全选</button>
         <button id="btnInvertSelect" class="btn-secondary" title="反向勾选可见图片">反选</button>
         <button id="btnSelectLarge" class="btn-secondary" title="仅勾选长边至少 1000px 的高清大图">仅选大图</button>
         <button id="btnClearSelect" class="btn-secondary" title="取消所有勾选">清空</button>
       </div>
 
-      <!-- 选中统计看板 -->
-      <div class="selection-summary">
+      <!-- 选中统计看板与配额提示 -->
+      <div class="selection-summary" role="status" aria-live="polite">
         <span class="stat-item" id="statCollectedWrapper">
           已采集：<strong id="statCollectedCount">0</strong> 张
         </span>
@@ -172,11 +185,14 @@
   <!-- 主体画廊容器 -->
   <main class="gallery-container">
     <!-- 采集加载中状态 -->
-    <div id="loadingState" class="collector-loading-state hidden">
+    <div id="loadingState" class="collector-loading-state hidden" role="status" aria-live="polite">
       <div class="collector-spinner"></div>
       <h3 id="loadingStateTitle">正在采集网页图片…</h3>
       <p class="loading-subtext" id="loadingStateSubtext">正在识别图片并检测真实尺寸，图片较多时可能需要一些时间。</p>
-      <div class="collector-loading-counter hidden" id="loadingProgressCounter">已识别 0 张</div>
+      <div class="collector-loading-bar-wrapper hidden" id="loadingBarWrapper" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="collector-loading-bar-fill" id="loadingBarFill" style="width: 0%;"></div>
+      </div>
+      <div class="collector-loading-counter hidden" id="loadingProgressCounter">正在发现网页图片…</div>
     </div>
 
     <!-- 采集失败错误状态 -->
