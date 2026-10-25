@@ -50,8 +50,8 @@
         </button>
       </div>
 
-      <!-- 深度穿透 (Deep Grab) 操作按钮 -->
-      <button id="btnDeepGrab" class="btn-deep-grab hidden" title="从详情页智能穿透提取 4K/HD 真实主角大图">
+      <!-- 深度穿透 (Deep Grab) 操作入口（本轮按规范已停用） -->
+      <button id="btnDeepGrab" class="btn-deep-grab hidden" style="display: none !important;" aria-hidden="true" title="从详情页智能穿透提取 4K/HD 真实主角大图">
         <span class="deep-icon">⚡</span>
         <span class="deep-text" id="deepGrabText">深度穿透 (Deep Grab)</span>
         <span class="deep-badge" id="deepGrabBadge">0</span>
@@ -239,14 +239,14 @@
     </div>
   </div>
 
-  <!-- 模态框 2：150MB 内存安全保护警告 -->
+  <!-- 模态框 2：150MB 数据保护阈值警告 -->
   <div id="modalQuotaGuard" class="modal-backdrop hidden">
     <div class="modal-card quota-card">
       <div class="quota-warning-icon">⚠️</div>
       <h2>单包体积保护上限警告</h2>
       <p class="quota-description">
-        当前已下载图片体积已达到 <strong id="currentDownloadedSizeText">150 MB</strong>。<br>
-        根据 Chrome 扩展内存保护机制，为了避免浏览器标签页发生 OOM 内存崩溃或页面假死，建议立即完成当前分批打包。
+        当前已下载图片体积已达到 <strong id="currentDownloadedSizeText">150 MB</strong> 数据保护阈值。<br>
+        建议停止后续下载并打包当前已完成的图片，避免单次任务数据过大影响下载稳定性。
       </p>
 
       <div class="quota-modal-actions">
@@ -254,7 +254,7 @@
           📦 停止后续下载，仅打包当前已完成图片
         </button>
         <button id="btnQuotaContinue" class="btn-secondary">
-          继续下载剩余图片（内存占用较高）
+          继续下载剩余图片（单包体积较大）
         </button>
       </div>
     </div>
@@ -279,8 +279,8 @@
     </div>
   </div>
 
-  <!-- 浮动轻量穿透进度面板 -->
-  <div id="deepGrabConsole" class="deep-grab-console hidden">
+  <!-- 浮动轻量穿透进度面板（本轮按规范已停用） -->
+  <div id="deepGrabConsole" class="deep-grab-console hidden" style="display: none !important;" aria-hidden="true">
     <div class="deep-console-inner">
       <div class="deep-spinner"></div>
       <div class="deep-info-block">

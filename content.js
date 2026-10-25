@@ -1,10 +1,10 @@
 /**
- * Web Image Collector - Content Script (网页图片嗅探器 - 精准修复版)
+ * Web Image Collector - Content Script (网页图片嗅探器 - 核心修复版)
  * 运行在宿主页面上下文中：
  * 1. 严格过滤不可见元素与头像/logo等小杂质（>=150px 门槛）
- * 2. DOM 节点就地决选：单个 <img> 元素内部决选最高清 URL，从源头杜绝单个元素多次录入
- * 3. 跨节点安全去重：仅当【完整 URL 字符串完全相同】时执行去重，绝不盲目截断 ? 参数
- * 4. 白名单 CDN 增强：仅对 images.unsplash.com 等受信域名调整画质参数，非白名单域名保留原始完整 URL
+ * 2. DOM 节点就地决选：单个 <img> 元素内部决选最高清 URL（direct link > data-original > srcset > lazy > src），并保留主图 fallbackUrl
+ * 3. 跨节点保真去重：以完整规范化绝对 URL 字符串为基准去重，绝不截断 ? 查询参数或丢失签名/ID
+ * 4. 统一职责：采集层忠实保留网页原始真实 URL，由画廊层统一负责安全的超清增强与失败回退调度
  */
 
 (function () {
@@ -27,43 +27,6 @@
       return new URL(trimmed, baseUrl).href;
     } catch {
       return null;
-    }
-  }
-
-  /**
-   * 白名单 CDN 增强逻辑：
-   * 仅对白名单域名（如 images.unsplash.com）安全调整已知的画质参数。
-   * 对所有非白名单网站，严格保留原始完整 URL（包括所有 query 参数与签名），确保绝对兼容性。
-   */
-  function enhanceToHighResUrl(rawUrl) {
-    if (!rawUrl || rawUrl.startsWith('data:')) return rawUrl;
-
-    try {
-      const parsed = new URL(rawUrl, window.location.href);
-      const host = parsed.hostname.toLowerCase();
-
-      // 白名单：Unsplash CDN
-      if (host === 'images.unsplash.com' || host.endsWith('.unsplash.com')) {
-        const sp = parsed.searchParams;
-        if (sp.has('w')) {
-          const curW = parseInt(sp.get('w'), 10) || 0;
-          if (curW < 2560) {
-            sp.set('w', '2560'); // 安全提升至 2560px 原画
-          }
-        }
-        if (sp.has('q')) {
-          sp.set('q', '85'); // 提高画质压缩比
-        }
-        if (sp.get('fit') === 'crop') {
-          sp.set('fit', 'max'); // 避免强制切头切尾裁剪，保留完整比例
-        }
-        return parsed.href;
-      }
-
-      // 所有非白名单网站，必须保留原始完整 URL，严禁篡改任何路径或参数
-      return rawUrl;
-    } catch {
-      return rawUrl;
     }
   }
 
@@ -262,7 +225,7 @@
     // 跨节点的去重逻辑：安全基准，仅当【完整 URL 字符串完全相同】时执行去重
     const candidateMap = new Map(); // targetUrl -> ImageCandidate
 
-    function registerCandidate({ url, width = 0, height = 0, alt = '', source = 'img', detailUrl = null, hasDetailLink = false }) {
+    function registerCandidate({ url, primaryUrl = null, width = 0, height = 0, alt = '', source = 'img', detailUrl = null, hasDetailLink = false }) {
       const absUrl = normalizeUrl(url);
       if (!absUrl) return;
 
@@ -271,8 +234,10 @@
         return;
       }
 
-      // 仅白名单 CDN 调整参数，非白名单严格保留原始完整 URL
-      const targetUrl = enhanceToHighResUrl(absUrl);
+      // 统一职责：采集层忠实保留网页原始完整 URL（保留所有 query、签名与 token），绝不篡改 CDN 参数
+      const targetUrl = absUrl;
+      const absPrimary = primaryUrl ? normalizeUrl(primaryUrl) : null;
+      const fallbackUrl = (absPrimary && absPrimary !== targetUrl) ? absPrimary : null;
 
       // 安全基准去重：仅当完整 URL 字符串完全相同时去重
       if (candidateMap.has(targetUrl)) {
@@ -284,9 +249,14 @@
           existing.detailUrl = detailUrl;
           existing.hasDetailLink = true;
         }
+        if (!existing.fallbackUrl && fallbackUrl) {
+          existing.fallbackUrl = fallbackUrl;
+        }
       } else {
         candidateMap.set(targetUrl, {
           url: targetUrl,
+          originalUrl: targetUrl,
+          fallbackUrl: fallbackUrl,
           width: width || 0,
           height: height || 0,
           alt: (alt || '').trim().slice(0, 100),
@@ -371,19 +341,20 @@
         }
       }
 
-      // 最后降级为当前常规 src (优先 currentSrc，降级 src)
+      // 记录当前常规真实主图 src (优先 currentSrc，降级 src)，作为 DOM 级降级 fallbackUrl
+      const primaryUrl = img.currentSrc || img.src;
       if (!chosenUrl) {
-        const primaryUrl = img.currentSrc || img.src;
         if (primaryUrl) {
           chosenUrl = primaryUrl;
           chosenSource = 'img';
         }
       }
 
-      // 单个 <img> 仅录入就地胜出的唯一最高清 URL，并附带 detailUrl 元数据
+      // 单个 <img> 仅录入就地胜出的唯一最高清 URL，附带 primaryUrl 作为降级原图
       if (chosenUrl) {
         registerCandidate({
           url: chosenUrl,
+          primaryUrl: primaryUrl,
           width: chosenWidth,
           height: chosenHeight,
           alt: img.alt || img.title,
@@ -482,9 +453,11 @@
       }
     });
 
-    // 输出清洗后的图片列表（包含原图穿透元数据）
+    // 输出清洗后的图片列表（包含原始地址与降级元数据）
     const finalResults = Array.from(candidateMap.values()).map(item => ({
       url: item.url,
+      originalUrl: item.originalUrl || item.url,
+      fallbackUrl: item.fallbackUrl || null,
       width: item.width,
       height: item.height,
       alt: item.alt,

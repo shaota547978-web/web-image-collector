@@ -21,21 +21,17 @@
 
     // 下载运行时状态
     isDownloading: false,
-    cancelRequested: false,
-    downloadMap: new Map(),  // url -> { status: 'idle'|'downloading'|'success'|'failed', error?: string, blob?: Blob, size?: number, filename?: string }
+    cancelRequested: false,       // 用户主动点击“取消下载”标记
+    stopAndZipRequested: false,   // 触发150MB保护后用户选择“停止后续下载，仅打包已完成图片”标记
+    downloadMap: new Map(),       // url -> { status: 'idle'|'downloading'|'success'|'failed', error?: string, blob?: Blob, size?: number, filename?: string }
     totalDownloadedBytes: 0,
-    quotaWarned: false,      // 是否已触发过 150MB 警告
-    quotaPauseResolver: null,// 暂停等待用户决策的 Promise resolver
-    activeWorkersCount: 0,
-
-    // 原图穿透 (Deep Grab) 状态
-    isDeepGrabbing: false,
-    deepGrabCancelRequested: false
+    quotaWarned: false,           // 是否已触发过 150MB 保护警告
+    quotaPauseResolver: null,     // 暂停等待用户决策的 Promise resolver
+    activeWorkersCount: 0
   };
 
   const MAX_CONCURRENCY = 3;
-  const MAX_DEEP_CONCURRENCY = 2; // 穿透详情页严格限制为 2 并发
-  const QUOTA_LIMIT_BYTES = 150 * 1024 * 1024; // 150MB
+  const QUOTA_LIMIT_BYTES = 150 * 1024 * 1024; // 150MB 下载数据量保护阈值
 
   // -------------------------------------------------------------
   // 2. DOM 元素缓存
@@ -77,7 +73,7 @@
     emptySubtext: document.getElementById('emptySubtext'),
     galleryGrid: document.getElementById('galleryGrid'),
 
-    // 穿透进度面板
+    // 穿透进度面板（入口停用）
     deepGrabConsole: document.getElementById('deepGrabConsole'),
     deepGrabPhaseText: document.getElementById('deepGrabPhaseText'),
     deepGrabProgressFill: document.getElementById('deepGrabProgressFill'),
@@ -138,6 +134,7 @@
       if (mime.includes('webp')) return 'webp';
       if (mime.includes('svg')) return 'svg';
       if (mime.includes('gif')) return 'gif';
+      if (mime.includes('avif')) return 'avif';
       return 'jpg';
     }
     try {
@@ -161,15 +158,107 @@
     return ext;
   }
 
-  function getBaseImageUrl(rawUrl) {
-    if (!rawUrl) return '';
-    if (rawUrl.startsWith('data:')) return rawUrl;
-    try {
-      const parsed = new URL(rawUrl);
-      return `${parsed.origin}${parsed.pathname}`;
-    } catch {
-      return rawUrl.split('?')[0].split('#')[0];
+  /**
+   * 严格检验下载内容是否为真实图片（防止伪装为图片的 HTML 错误页/JSON 错误响应等）
+   * 兼容 JPG, PNG, WebP, GIF, SVG, AVIF, BMP, ICO
+   * 仅通过头部魔数（Magic Bytes）或轻量文本探测，不执行高开销的完整解码
+   */
+  async function detectAndValidateImageFormat(blob) {
+    if (!blob || blob.size < 4) {
+      return { isValid: false, error: '获取到的图片数据过小或为空' };
     }
+
+    const mime = (blob.type || '').toLowerCase();
+
+    // 1. 读取前 64 字节检查二进制图片魔数 (Magic Bytes)
+    try {
+      const slice = blob.slice(0, 64);
+      const buffer = await slice.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+
+      // JPEG: FF D8 FF
+      if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
+        return { isValid: true, ext: 'jpg', mime: 'image/jpeg' };
+      }
+
+      // PNG: 89 50 4E 47 0D 0A 1A 0A
+      if (bytes.length >= 8 &&
+          bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
+          bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A) {
+        return { isValid: true, ext: 'png', mime: 'image/png' };
+      }
+
+      // GIF: 'GIF87a' 或 'GIF89a'
+      if (bytes.length >= 6 &&
+          bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 &&
+          bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
+        return { isValid: true, ext: 'gif', mime: 'image/gif' };
+      }
+
+      // WebP: 'RIFF' .... 'WEBP'
+      if (bytes.length >= 12 &&
+          bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+          bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+        return { isValid: true, ext: 'webp', mime: 'image/webp' };
+      }
+
+      // AVIF: 检查 ISO BMFF 'ftyp' 与 brand 'avif' / 'avis' / 'mif1'
+      if (bytes.length >= 12 &&
+          bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]).toLowerCase();
+        if (brand === 'avif' || brand === 'avis' || brand === 'mif1') {
+          return { isValid: true, ext: 'avif', mime: 'image/avif' };
+        }
+      }
+
+      // BMP: 'BM'
+      if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4D) {
+        return { isValid: true, ext: 'bmp', mime: 'image/bmp' };
+      }
+
+      // ICO: 00 00 01 00
+      if (bytes.length >= 4 && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x01 && bytes[3] === 0x00) {
+        return { isValid: true, ext: 'ico', mime: 'image/x-icon' };
+      }
+    } catch {
+      // 继续尝试文本探测
+    }
+
+    // 2. 文本类图片 (如 SVG) 及 HTML/JSON 伪装探测（读取前 512 字节）
+    try {
+      const textSlice = blob.slice(0, 512);
+      const textBuffer = await textSlice.arrayBuffer();
+      const text = new TextDecoder('utf-8').decode(textBuffer).trim().toLowerCase();
+
+      // 明确拦截：HTML 错误页（如 404/500/Cloudflare 拦截）或 JSON 接口响应
+      if (text.startsWith('<!doctype html') ||
+          text.startsWith('<html') ||
+          text.includes('<head>') ||
+          text.includes('<body>') ||
+          text.startsWith('{"') ||
+          text.startsWith('{\n') ||
+          text.startsWith('[{')) {
+        return { isValid: false, error: '目标地址返回了 HTML 错误页或 JSON 数据，非有效图片' };
+      }
+
+      // 验证 SVG 矢量图
+      if (text.includes('<svg') && (text.includes('xmlns') || text.includes('viewbox') || text.includes('<path') || text.includes('<g') || text.includes('<circle') || text.includes('<rect') || text.startsWith('<svg'))) {
+        return { isValid: true, ext: 'svg', mime: 'image/svg+xml' };
+      }
+    } catch {
+      // 忽略
+    }
+
+    // 3. 兜底检查：若 mime 明确为 image/* 且未命中 html/json
+    if (mime.startsWith('image/')) {
+      const sub = mime.substring(6).split('+')[0];
+      if (['jpeg', 'jpg', 'png', 'webp', 'gif', 'svg', 'avif', 'bmp', 'x-icon', 'vnd.microsoft.icon'].includes(sub)) {
+        const cleanExt = (sub === 'jpeg' || sub === 'jpg') ? 'jpg' : (sub.includes('icon') ? 'ico' : sub);
+        return { isValid: true, ext: cleanExt, mime: mime };
+      }
+    }
+
+    return { isValid: false, error: '文件内容非受支持的有效图片格式 (Magic Bytes 校验未通过)' };
   }
 
   function enhanceToHighResUrl(rawUrl) {
@@ -312,36 +401,42 @@
         showAlert(task.warning);
       }
 
-      // 对图片进行 base_url 规范化去重与超清原画增强
+      // 修复 1：采用完整、有效的图片 URL 判断重复，绝不删除 ? 后的查询参数，确保不同 id/sign/token 的图片不被合并
       const dedupeMap = new Map();
       task.images.forEach(img => {
-        const cleanUrl = enhanceToHighResUrl(img.url);
-        const baseUrl = getBaseImageUrl(cleanUrl);
-        if (!baseUrl) return;
+        if (!img || !img.url) return;
+        const rawUrl = img.url.trim();
+        if (!rawUrl) return;
 
+        // 统一在画廊层执行白名单 CDN 高清增强，并严格保留 originalUrl 与 fallbackUrl
+        const originalUrl = img.originalUrl || rawUrl;
+        const fallbackUrl = img.fallbackUrl || null;
+        const enhancedUrl = enhanceToHighResUrl(originalUrl);
+
+        // 去重主键以完整的原始 URL 规范化标识（杜绝截断 query 导致不同图片被合并）
+        const dedupeKey = rawUrl;
         const currentScore = Math.max(img.width || 0, img.height || 0);
 
-        if (dedupeMap.has(baseUrl)) {
-          const existing = dedupeMap.get(baseUrl);
+        if (dedupeMap.has(dedupeKey)) {
+          const existing = dedupeMap.get(dedupeKey);
           const existingScore = Math.max(existing.width || 0, existing.height || 0);
           if (currentScore > existingScore) {
-            existing.url = cleanUrl;
             existing.width = Math.max(existing.width || 0, img.width || 0);
             existing.height = Math.max(existing.height || 0, img.height || 0);
-            if (img.alt) existing.alt = img.alt;
-            if (img.detailUrl) {
-              existing.detailUrl = img.detailUrl;
-              existing.hasDetailLink = true;
-            }
-          } else if (img.detailUrl && !existing.detailUrl) {
+          }
+          if (!existing.alt && img.alt) existing.alt = img.alt;
+          if (!existing.fallbackUrl && fallbackUrl) existing.fallbackUrl = fallbackUrl;
+          if (!existing.originalUrl && originalUrl) existing.originalUrl = originalUrl;
+          if (!existing.detailUrl && img.detailUrl) {
             existing.detailUrl = img.detailUrl;
             existing.hasDetailLink = true;
           }
         } else {
-          dedupeMap.set(baseUrl, {
+          dedupeMap.set(dedupeKey, {
             ...img,
-            url: cleanUrl,
-            baseUrl: baseUrl,
+            url: enhancedUrl, // 优先尝试超清增强地址
+            originalUrl: originalUrl, // 保留原始未增强地址用于下载失败自动回退
+            fallbackUrl: fallbackUrl, // 保留 DOM 级主图降级地址
             detailUrl: img.detailUrl || null,
             hasDetailLink: !!img.detailUrl
           });
@@ -349,9 +444,6 @@
       });
 
       state.allImages = Array.from(dedupeMap.values());
-
-      // 更新深度穿透按钮展示状态
-      updateDeepGrabButtonBadge();
 
       // 默认全选前 20 张（或全部若小于 20 张）
       applyFilters();
@@ -375,350 +467,11 @@
   }
 
   // -------------------------------------------------------------
-  // 原图穿透 (Deep Grab) 辅助与启发式解析算法
+  // 原图穿透 (Deep Grab) 辅助（本轮停用入口与穿透请求，保留结构兼容）
   // -------------------------------------------------------------
-  function updateDeepGrabButtonBadge() {
-    const pendingCount = state.allImages.filter(img => img.hasDetailLink && img.detailUrl && img.deepGrabStatus !== 'success').length;
-    if (pendingCount > 0) {
-      dom.btnDeepGrab.classList.remove('hidden');
-      dom.deepGrabText.textContent = `深度穿透 (${pendingCount})`;
-      dom.deepGrabBadge.textContent = pendingCount;
-    } else {
-      const successCount = state.allImages.filter(img => img.deepGrabStatus === 'success').length;
-      if (successCount > 0) {
-        dom.btnDeepGrab.classList.remove('hidden');
-        dom.deepGrabText.textContent = `穿透完成 (${successCount})`;
-        dom.deepGrabBadge.textContent = '✓';
-      } else {
-        dom.btnDeepGrab.classList.add('hidden');
-      }
-    }
-  }
-
   function renderDeepGrabBadge(img) {
-    if (!img.hasDetailLink && !img.detailUrl) return '';
-
-    if (img.deepGrabStatus === 'success') {
-      const label = img.is4K ? '⚡ 4K 原图' : '⚡ HD 原图';
-      return `<span class="badge-deep-grab success" title="已成功穿透详情页提取最高画质原图">${label}</span>`;
-    }
-    if (img.deepGrabStatus === 'resolving') {
-      return `<span class="badge-deep-grab resolving">⚡ 解析中...</span>`;
-    }
-    if (img.deepGrabStatus === 'fallback') {
-      return `<span class="badge-deep-grab fallback" title="详情页未发现更高清大图，已保留预览图">已保持预览图</span>`;
-    }
-    // 待穿透状态
-    return `<span class="badge-deep-grab ready" title="检测到详情页：${escapeHtml(img.detailUrl)}，点击顶部深度穿透提取原画">⚡ 可提取原图</span>`;
-  }
-
-  function updateCardDeepGrabUI(item, cardEl) {
-    const card = cardEl || dom.galleryGrid.querySelector(`.image-card[data-url="${CSS.escape(item.url)}"]`);
-    if (!card) return;
-
-    let badge = card.querySelector('.badge-deep-grab');
-    const badgeHtml = renderDeepGrabBadge(item);
-
-    if (!badgeHtml) {
-      if (badge) badge.remove();
-      return;
-    }
-
-    if (!badge) {
-      const thumb = card.querySelector('.card-thumb-wrapper');
-      if (thumb) {
-        const temp = document.createElement('div');
-        temp.innerHTML = badgeHtml;
-        badge = temp.firstElementChild;
-        thumb.appendChild(badge);
-      }
-    } else {
-      badge.outerHTML = badgeHtml;
-    }
-  }
-
-  function updateCardWithResolvedHero(item, oldUrl) {
-    let card = dom.galleryGrid.querySelector(`.image-card[data-url="${CSS.escape(oldUrl)}"]`);
-    if (!card) {
-      card = dom.galleryGrid.querySelector(`.image-card[data-url="${CSS.escape(item.url)}"]`);
-    }
-    if (!card) return;
-
-    card.dataset.url = item.url;
-
-    const imgEl = card.querySelector('.card-thumb-wrapper img');
-    if (imgEl) {
-      imgEl.src = item.url;
-    }
-
-    const resBadge = card.querySelector('.badge-res');
-    if (resBadge) {
-      const isLarge = (item.width >= 1000 || item.height >= 1000);
-      resBadge.textContent = (item.width > 0 && item.height > 0) ? `${item.width} × ${item.height}` : '未知尺寸';
-      if (isLarge) resBadge.classList.add('large-res');
-    }
-
-    updateCardDeepGrabUI(item, card);
-  }
-
-  function preloadImageDimensions(url) {
-    return new Promise((resolve) => {
-      const img = new Image();
-      const timer = setTimeout(() => {
-        resolve({ width: 0, height: 0 });
-      }, 5000);
-
-      img.onload = () => {
-        clearTimeout(timer);
-        resolve({
-          width: img.naturalWidth || img.width || 0,
-          height: img.naturalHeight || img.height || 0
-        });
-      };
-
-      img.onerror = () => {
-        clearTimeout(timer);
-        resolve({ width: 0, height: 0 });
-      };
-
-      img.src = url;
-    });
-  }
-
-  /**
-   * 详情页 HTML 解析与“主角图”启发式算法
-   */
-  async function resolveHeroImageFromDetail(detailUrl) {
-    if (!detailUrl) return null;
-
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-      const resp = await fetch(detailUrl, {
-        method: 'GET',
-        signal: controller.signal,
-        credentials: 'omit',
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-        }
-      });
-      clearTimeout(timeoutId);
-
-      if (!resp.ok) return null;
-      const htmlText = await resp.text();
-      if (!htmlText) return null;
-
-      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
-
-      function isValidImgCandidate(u) {
-        if (!u || typeof u !== 'string') return false;
-        const t = u.trim();
-        if (!t || t.startsWith('javascript:') || t.startsWith('data:') || t.startsWith('#')) return false;
-        return true;
-      }
-
-      // 优先级 A（官方元数据）：检查 og:image 与 twitter:image
-      const ogMeta = doc.querySelector('meta[property="og:image:secure_url"]') ||
-                     doc.querySelector('meta[property="og:image"]') ||
-                     doc.querySelector('meta[name="twitter:image"]') ||
-                     doc.querySelector('meta[name="twitter:image:src"]');
-      if (ogMeta) {
-        const content = ogMeta.getAttribute('content');
-        if (isValidImgCandidate(content)) {
-          try {
-            return new URL(content.trim(), detailUrl).href;
-          } catch {}
-        }
-      }
-
-      // 优先级 B（下载直链）：检查页面中是否存在带有 download 属性的 <a>，或类名包含 download-btn、btn-download、origin-image、view-full 的 <a> 链接
-      const downloadSelectors = [
-        'a[download]',
-        'a.download-btn',
-        'a.btn-download',
-        'a.origin-image',
-        'a.view-full',
-        'a.full-size',
-        'a[href*="download"]',
-        'a[class*="download"]',
-        'a[id*="download"]'
-      ];
-      const downloadLinks = doc.querySelectorAll(downloadSelectors.join(','));
-      for (const a of downloadLinks) {
-        const rawHref = a.getAttribute('href');
-        if (isValidImgCandidate(rawHref)) {
-          try {
-            const abs = new URL(rawHref.trim(), detailUrl).href;
-            if (/\.(jpe?g|png|webp|avif|bmp)(?:[\?#]|$)/i.test(abs) || /\/(?:raw|original|large|download)\//i.test(abs)) {
-              return abs;
-            }
-          } catch {}
-        }
-      }
-
-      // 优先级 C（主画布启发式）：检索详情页中所有的 <img>，选取 width*height 最大、或文件名含有 raw/original/large 的一张作为主角
-      const images = Array.from(doc.querySelectorAll('img'));
-      let bestCandidate = null;
-      let maxScore = -1;
-
-      const excludeRegex = /(avatar|logo|icon|ad-|advertisement|banner|related|recommend|comment|user|thumb|small)/i;
-      const highResRegex = /(raw|original|large|full|wallpaper|origin|master|hires)/i;
-
-      for (const img of images) {
-        const rawSrc = img.getAttribute('data-original') ||
-                       img.getAttribute('data-src') ||
-                       img.getAttribute('data-highres') ||
-                       img.getAttribute('src');
-
-        if (!isValidImgCandidate(rawSrc)) continue;
-
-        try {
-          const absSrc = new URL(rawSrc.trim(), detailUrl).href;
-          const className = `${img.className || ''} ${img.parentElement?.className || ''}`;
-          const id = `${img.id || ''} ${img.parentElement?.id || ''}`;
-          const alt = img.getAttribute('alt') || '';
-
-          if (excludeRegex.test(className) || excludeRegex.test(id) || excludeRegex.test(absSrc) || excludeRegex.test(alt)) {
-            continue;
-          }
-
-          const w = parseInt(img.getAttribute('width') || img.getAttribute('data-width') || '0', 10);
-          const h = parseInt(img.getAttribute('height') || img.getAttribute('data-height') || '0', 10);
-          let score = (w * h) || 1;
-
-          if (highResPattern.test(absSrc) || highResPattern.test(className) || highResPattern.test(id)) {
-            score += 10000000;
-          }
-
-          // 检查 srcset
-          const rawSrcset = img.getAttribute('srcset');
-          if (rawSrcset) {
-            const best = extractBestFromSrcset(rawSrcset);
-            if (best && best.score > 1000) {
-              score += best.score * 5000;
-            }
-          }
-
-          if (score > maxScore) {
-            maxScore = score;
-            bestCandidate = absSrc;
-          }
-        } catch {}
-      }
-
-      if (bestCandidate) {
-        return bestCandidate;
-      }
-
-      return null;
-    } catch (err) {
-      console.warn('[Deep Grab] 穿透解析详情页失败:', detailUrl, err.message);
-      return null;
-    }
-  }
-
-  function updateDeepGrabConsoleProgress(completed, total, phaseText) {
-    if (phaseText) dom.deepGrabPhaseText.textContent = phaseText;
-    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
-    dom.deepGrabProgressFill.style.width = `${percent}%`;
-  }
-
-  /**
-   * 启动受控并发穿透流程 (并发限制 2，微延迟 200ms)
-   */
-  async function startDeepGrab() {
-    if (state.isDeepGrabbing) return;
-
-    const candidates = state.allImages.filter(img => img.hasDetailLink && img.detailUrl && img.deepGrabStatus !== 'success');
-    if (candidates.length === 0) {
-      showAlert('当前画廊没有检测到可穿透的详情页，或者全部图片已穿透完成！');
-      return;
-    }
-
-    state.isDeepGrabbing = true;
-    state.deepGrabCancelRequested = false;
-    dom.btnDeepGrab.disabled = true;
-    dom.deepGrabConsole.classList.remove('hidden');
-
-    const total = candidates.length;
-    let finishedCount = 0;
-    let successCount = 0;
-    let fallbackCount = 0;
-
-    updateDeepGrabConsoleProgress(0, total, `正在穿透详情页: 0/${total}...`);
-
-    let currentIndex = 0;
-
-    async function deepWorker() {
-      while (currentIndex < candidates.length) {
-        if (state.deepGrabCancelRequested) break;
-        const myIdx = currentIndex++;
-        const item = candidates[myIdx];
-
-        item.deepGrabStatus = 'resolving';
-        updateCardDeepGrabUI(item);
-
-        updateDeepGrabConsoleProgress(
-          finishedCount,
-          total,
-          `正在穿透详情页 (${finishedCount + 1}/${total})...`
-        );
-
-        // 保护性微延迟 200ms
-        await new Promise(r => setTimeout(r, 200));
-        if (state.deepGrabCancelRequested) break;
-
-        const heroUrl = await resolveHeroImageFromDetail(item.detailUrl);
-
-        if (heroUrl && heroUrl !== item.url) {
-          const dims = await preloadImageDimensions(heroUrl);
-          const oldUrl = item.url;
-          item.originalPreviewUrl = oldUrl;
-          item.url = heroUrl;
-          if (dims.width > 0) item.width = dims.width;
-          if (dims.height > 0) item.height = dims.height;
-
-          item.is4K = Math.max(item.width, item.height) >= 2560;
-          item.deepGrabStatus = 'success';
-          successCount++;
-
-          if (state.selectedUrls.has(oldUrl)) {
-            state.selectedUrls.delete(oldUrl);
-            state.selectedUrls.add(heroUrl);
-          }
-
-          updateCardWithResolvedHero(item, oldUrl);
-        } else {
-          item.deepGrabStatus = 'fallback';
-          fallbackCount++;
-          updateCardDeepGrabUI(item);
-        }
-
-        finishedCount++;
-        updateDeepGrabConsoleProgress(finishedCount, total);
-      }
-    }
-
-    const pool = [];
-    const workerCount = Math.min(MAX_DEEP_CONCURRENCY, candidates.length);
-    for (let i = 0; i < workerCount; i++) {
-      pool.push(deepWorker());
-    }
-
-    await Promise.all(pool);
-
-    state.isDeepGrabbing = false;
-    dom.btnDeepGrab.disabled = false;
-    dom.deepGrabConsole.classList.add('hidden');
-    updateDeepGrabButtonBadge();
-    updateSelectionSummary();
-
-    if (state.deepGrabCancelRequested) {
-      showAlert(`深度穿透已中止：已处理 ${finishedCount} 张，成功提取 ${successCount} 张高清原图。`);
-    } else {
-      showAlert(`🎉 深度穿透完成！成功提取 ${successCount} 张 4K/HD 原画大图，${fallbackCount} 张保持原预览。`);
-    }
+    // 本轮按要求暂时停用 Deep Grab 视觉标签展示
+    return '';
   }
 
   // -------------------------------------------------------------
@@ -773,8 +526,7 @@
 
       card.innerHTML = `
         <div class="card-thumb-wrapper">
-          <img src="${escapeHtml(img.url)}" alt="${escapeHtml(img.alt || 'image')}" loading="lazy" />
-          ${renderDeepGrabBadge(img)}
+          <img src="${escapeHtml(img.url)}" alt="${escapeHtml(img.alt || 'image')}" loading="lazy" ${img.originalUrl && img.originalUrl !== img.url ? `onerror="if(this.dataset.fallback && this.src !== this.dataset.fallback){this.src=this.dataset.fallback;}" data-fallback="${escapeHtml(img.originalUrl)}"` : ''} />
         </div>
 
         <div class="card-checkbox-wrapper">
@@ -981,7 +733,7 @@
   }
 
   // -------------------------------------------------------------
-  // 7. 并发控制下载池 (Max 3 Concurrency) 与 150MB 内存保护
+  // 7. 并发控制下载池 (Max 3 Concurrency) 与 150MB 数据保护阈值
   // -------------------------------------------------------------
   async function startBatchDownload() {
     if (state.selectedUrls.size === 0 || state.isDownloading) return;
@@ -994,6 +746,7 @@
 
     state.isDownloading = true;
     state.cancelRequested = false;
+    state.stopAndZipRequested = false;
     state.totalDownloadedBytes = 0;
     state.quotaWarned = false;
     state.downloadMap.clear();
@@ -1007,7 +760,7 @@
     const targetUrls = Array.from(state.selectedUrls);
     const totalCount = targetUrls.length;
 
-    updateConsoleProgress(0, totalCount, '正在初始化下载连接...', `并发池限制: ${MAX_CONCURRENCY} | 目标: ${totalCount} 张`);
+    updateConsoleProgress(0, totalCount, '正在初始化下载连接...', `并发限制: ${MAX_CONCURRENCY} | 数据量保护阈值: 150MB`);
 
     // 初始化每张卡片状态
     targetUrls.forEach(url => {
@@ -1025,7 +778,7 @@
 
       async function worker() {
         while (currentIndex < targetUrls.length) {
-          if (state.cancelRequested) break;
+          if (state.cancelRequested || state.stopAndZipRequested) break;
 
           const myIndex = currentIndex++;
           const url = targetUrls[myIndex];
@@ -1034,7 +787,7 @@
           if (state.quotaPauseResolver) {
             await state.quotaPauseResolver.promise;
           }
-          if (state.cancelRequested) break;
+          if (state.cancelRequested || state.stopAndZipRequested) break;
 
           state.downloadMap.set(url, { status: 'downloading' });
           updateCardStatusUI(url, 'downloading');
@@ -1043,11 +796,12 @@
             completedCount,
             totalCount,
             `正在并发下载 (${completedCount + 1}/${totalCount})...`,
-            `已占用内存: ${formatBytes(state.totalDownloadedBytes)}`
+            `已下载数据: ${formatBytes(state.totalDownloadedBytes)}`
           );
 
-          // 执行下载
-          const fetchResult = await fetchImageWithFallback(url);
+          // 执行下载（含高清->原图自动回退与真实图片格式校验）
+          const imgItem = state.allImages.find(img => img.url === url) || { url };
+          const fetchResult = await fetchImageWithFallback(imgItem);
 
           if (fetchResult.success) {
             const blob = fetchResult.blob;
@@ -1057,11 +811,11 @@
               status: 'success',
               blob: blob,
               size: blob.size,
-              filename: generateFileName(url, myIndex + 1, blob.type)
+              filename: generateFileName(url, myIndex + 1, fetchResult.mime, fetchResult.ext)
             });
             updateCardStatusUI(url, 'success', blob.size);
 
-            // 检查 150MB 保护上限
+            // 检查 150MB 数据保护阈值
             if (!state.quotaWarned && state.totalDownloadedBytes >= QUOTA_LIMIT_BYTES) {
               state.quotaWarned = true;
               pauseForQuotaGuard();
@@ -1097,15 +851,28 @@
     try {
       await runPool();
 
+      // 操作 C：用户主动点击“取消下载”
       if (state.cancelRequested) {
-        dom.consolePhaseText.textContent = '下载已由用户取消';
+        dom.consolePhaseText.textContent = '下载任务已由用户主动取消';
+        dom.consoleDetailText.textContent = '已中止全部操作，未生成任何压缩包';
+        dom.progressBarFill.style.width = '0%';
         finishDownloadSession();
         return;
       }
 
-      // 渲染错误面板 (若有失败项)
-      if (failedList.length > 0) {
-        showFailedDrawer(failedList);
+      // 操作 B：达到 150MB 保护后选择“停止并打包”时，标记未启动的图片为跳过
+      if (state.stopAndZipRequested) {
+        targetUrls.forEach(url => {
+          const item = state.downloadMap.get(url);
+          if (!item || item.status === 'pending') {
+            state.downloadMap.set(url, {
+              status: 'failed',
+              error: '已达 150MB 数据保护上限，已停止下载后续图片'
+            });
+            updateCardStatusUI(url, 'failed', 0, '保护阈值跳过');
+            failedList.push({ url, error: '已达 150MB 数据保护上限，已停止下载后续图片' });
+          }
+        });
       }
 
       // 汇总成功的 Blob
@@ -1116,18 +883,37 @@
         }
       });
 
+      const uncompletedCount = totalCount - successfulItems.length;
+
+      // 若未成功获取到任何有效图片
       if (successfulItems.length === 0) {
-        dom.consolePhaseText.textContent = '所有选中的图片均下载失败（受限于跨域或私有防盗链）';
+        dom.consolePhaseText.textContent = '未能成功下载任何图片，无法生成压缩包';
         dom.progressBarFill.style.width = '100%';
-        showAlert('选中的所有图片均因目标站点 CORS / 防盗链限制未能获取，无法生成压缩包。');
+        if (failedList.length > 0) {
+          showFailedDrawer(failedList);
+        }
+        showAlert('选中的所有图片均未能获取（可能受限于跨域 CORS 或防盗链），无法生成压缩包。');
         finishDownloadSession();
         return;
       }
 
-      // 阶段 2：执行本地 JSZip 打包
-      dom.consolePhaseText.textContent = `正在生成 ZIP 压缩包 (成功 ${successfulItems.length} 张)...`;
-      dom.consoleDetailText.textContent = `总包体积预估: ${formatBytes(state.totalDownloadedBytes)}`;
+      // 区分三种操作的状态反馈
+      if (state.stopAndZipRequested) {
+        // 操作 B：达到限制后选择“停止并打包”
+        dom.consolePhaseText.textContent = `保护限制停止：正在打包已完成的 ${successfulItems.length} 张图片 (未完成 ${uncompletedCount} 张)...`;
+        dom.consoleDetailText.textContent = `已下载数据量: ${formatBytes(state.totalDownloadedBytes)} (阈值 150MB)`;
+      } else {
+        // 操作 A：正常下载完成
+        dom.consolePhaseText.textContent = `正在生成 ZIP 压缩包 (成功 ${successfulItems.length} 张${uncompletedCount > 0 ? `，失败 ${uncompletedCount} 张` : ''})...`;
+        dom.consoleDetailText.textContent = `总包体积预估: ${formatBytes(state.totalDownloadedBytes)}`;
+      }
 
+      // 渲染错误/跳过报告抽屉 (若有失败或未完成项)
+      if (failedList.length > 0) {
+        showFailedDrawer(failedList);
+      }
+
+      // 阶段 2：执行本地 JSZip 打包
       const zip = new JSZip();
       successfulItems.forEach(item => {
         zip.file(item.filename, item.blob);
@@ -1144,9 +930,11 @@
         dom.consoleDetailText.textContent = `ZIP 压缩中: ${metadata.percent.toFixed(0)}%`;
       });
 
-      // 阶段 3：唤起下载保存
+      // 阶段 3：调起原生保存
       dom.progressBarFill.style.width = '100%';
-      dom.consolePhaseText.textContent = '打包完成！正在调起浏览器原生保存...';
+      dom.consolePhaseText.textContent = state.stopAndZipRequested
+        ? `打包完成！已保存 ${successfulItems.length} 张已完成图片 (未完成 ${uncompletedCount} 张)`
+        : `打包完成！已保存全部 ${successfulItems.length} 张图片`;
       triggerSaveZip(zipBlob);
 
     } catch (err) {
@@ -1164,16 +952,25 @@
     state.quotaPauseResolver = null;
   }
 
-  // 单张图片下载（带 CORS 失败降级捕获）
-  async function fetchImageWithFallback(url) {
+  // 单个 URL 请求与格式验证（Fix 3：防止伪装为图片的 HTML 错误页/JSON 错误响应）
+  async function fetchSingleUrlAndValidate(url) {
+    if (!url) return { success: false, error: '无效的图片地址' };
+
     // 1. 如果是 data URL
     if (url.startsWith('data:')) {
       try {
         const res = await fetch(url);
         const blob = await res.blob();
-        return { success: true, blob };
+        if (!blob || blob.size === 0) {
+          return { success: false, error: 'Data URL 内容为空' };
+        }
+        const validation = await detectAndValidateImageFormat(blob);
+        if (!validation.isValid) {
+          return { success: false, error: validation.error || 'Data URL 非有效图片格式' };
+        }
+        return { success: true, blob, ext: validation.ext, mime: validation.mime };
       } catch (err) {
-        return { success: false, error: 'Data URL 解析失败' };
+        return { success: false, error: 'Data URL 解析失败: ' + err.message };
       }
     }
 
@@ -1189,17 +986,44 @@
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
       }
 
+      const ct = (response.headers.get('content-type') || '').toLowerCase();
+      // 快速拦截明确标记为 HTML 或 JSON 的响应
+      if (ct.includes('text/html') || ct.includes('application/json')) {
+        throw new Error(`响应 Content-Type 为 ${ct}，非有效图片数据`);
+      }
+
       const blob = await response.blob();
       if (!blob || blob.size === 0) {
         throw new Error('获取到的图片内容为空 (0 bytes)');
       }
-      return { success: true, blob };
+
+      // 二进制/文本格式验证 (Magic Bytes 检查)
+      const validation = await detectAndValidateImageFormat(blob);
+      if (!validation.isValid) {
+        throw new Error(validation.error || '文件内容未通过图片格式校验');
+      }
+
+      return {
+        success: true,
+        blob: blob,
+        ext: validation.ext,
+        mime: validation.mime
+      };
 
     } catch (fetchErr) {
       // 3. 降级尝试：利用 Image 标签 + Canvas 转 Blob（应对部分允许绘制但不响应 fetch 的场景）
       try {
         const canvasBlob = await fetchViaCanvasFallback(url);
-        return { success: true, blob: canvasBlob };
+        const validation = await detectAndValidateImageFormat(canvasBlob);
+        if (!validation.isValid) {
+          throw new Error('Canvas 导出的数据格式校验失败');
+        }
+        return {
+          success: true,
+          blob: canvasBlob,
+          ext: validation.ext || 'png',
+          mime: validation.mime || 'image/png'
+        };
       } catch {
         return {
           success: false,
@@ -1207,6 +1031,64 @@
         };
       }
     }
+  }
+
+  // 图片多级下载与回退调度器（Fix 2 高清下载失败自动回退原始地址）
+  async function fetchImageWithFallback(itemOrUrl) {
+    let primaryUrl = '';
+    let originalUrl = null;
+    let fallbackUrl = null;
+
+    if (typeof itemOrUrl === 'string') {
+      primaryUrl = itemOrUrl;
+      const matched = state.allImages.find(img => img.url === itemOrUrl);
+      if (matched) {
+        originalUrl = matched.originalUrl;
+        fallbackUrl = matched.fallbackUrl;
+      }
+    } else if (itemOrUrl && typeof itemOrUrl === 'object') {
+      primaryUrl = itemOrUrl.url;
+      originalUrl = itemOrUrl.originalUrl;
+      fallbackUrl = itemOrUrl.fallbackUrl;
+    }
+
+    // 构建按优先级尝试的候选 URL 列表：[高清增强地址, 原始可下载地址, DOM级原图降级地址]
+    const candidates = [primaryUrl];
+    if (originalUrl && originalUrl !== primaryUrl && !candidates.includes(originalUrl)) {
+      candidates.push(originalUrl);
+    }
+    if (fallbackUrl && fallbackUrl !== primaryUrl && !candidates.includes(fallbackUrl)) {
+      candidates.push(fallbackUrl);
+    }
+
+    let lastError = null;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const candidateUrl = candidates[i];
+      const isFallback = (i > 0);
+
+      const result = await fetchSingleUrlAndValidate(candidateUrl);
+      if (result.success) {
+        if (isFallback) {
+          console.info(`[Gallery] 原始地址回退成功: ${candidateUrl}`);
+        }
+        return {
+          ...result,
+          usedUrl: candidateUrl,
+          isFallback: isFallback
+        };
+      } else {
+        lastError = result.error;
+        if (!isFallback && candidates.length > 1) {
+          console.warn(`[Gallery] 高清地址下载或校验失败 (${lastError})，自动回退原始地址: ${candidates[i + 1]}`);
+        }
+      }
+    }
+
+    return {
+      success: false,
+      error: lastError || '下载失败且无可用回退地址'
+    };
   }
 
   function fetchViaCanvasFallback(url) {
@@ -1249,25 +1131,29 @@
     });
   }
 
-  function generateFileName(url, index, mimeType) {
+  // 生成打包文件名（Fix 3：ZIP 中的扩展名与实际检测到的图片格式一致）
+  function generateFileName(url, index, mimeType, detectedExt) {
     const padIndex = String(index).padStart(3, '0');
-    let ext = 'jpg';
+    let ext = detectedExt;
 
-    if (mimeType) {
-      if (mimeType.includes('png')) ext = 'png';
-      else if (mimeType.includes('webp')) ext = 'webp';
-      else if (mimeType.includes('svg')) ext = 'svg';
-      else if (mimeType.includes('gif')) ext = 'gif';
-      else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = 'jpg';
-      else ext = getUrlExtension(url);
-    } else {
-      ext = getUrlExtension(url);
+    if (!ext) {
+      if (mimeType) {
+        if (mimeType.includes('png')) ext = 'png';
+        else if (mimeType.includes('webp')) ext = 'webp';
+        else if (mimeType.includes('svg')) ext = 'svg';
+        else if (mimeType.includes('gif')) ext = 'gif';
+        else if (mimeType.includes('avif')) ext = 'avif';
+        else if (mimeType.includes('jpeg') || mimeType.includes('jpg')) ext = 'jpg';
+        else ext = getUrlExtension(url);
+      } else {
+        ext = getUrlExtension(url);
+      }
     }
 
     return `image_${padIndex}.${ext}`;
   }
 
-  // 150MB 内存保护暂停
+  // 150MB 数据保护阈值暂停
   function pauseForQuotaGuard() {
     let resolver;
     const promise = new Promise(resolve => {
@@ -1279,11 +1165,13 @@
     dom.modalQuotaGuard.classList.remove('hidden');
   }
 
+  // 恢复/决策保护行为（Fix 4：明确区分停止并打包与取消下载）
   function resumeQuotaGuard(continueDownload) {
     dom.modalQuotaGuard.classList.add('hidden');
     if (!continueDownload) {
-      // 停止后续下载，立即打包
-      state.cancelRequested = true;
+      // 停止后续下载，仅打包已完成图片（设置 stopAndZipRequested，绝不能设置 cancelRequested）
+      state.stopAndZipRequested = true;
+      dom.consolePhaseText.textContent = '已触发数据保护上限，正在停止后续下载并准备打包...';
     }
     if (state.quotaPauseResolver) {
       state.quotaPauseResolver.resolve();
@@ -1379,6 +1267,8 @@
   // -------------------------------------------------------------
   async function downloadSingleImage(url) {
     try {
+      const item = state.allImages.find(img => img.url === url);
+      const fallbackUrl = (item && item.originalUrl !== url) ? item.originalUrl : null;
       const ext = getUrlExtension(url);
       const filename = `single_image_${Date.now()}.${ext}`;
 
@@ -1387,15 +1277,27 @@
           url: url,
           filename: filename,
           saveAs: true
-        }, (id) => {
+        }, () => {
           if (chrome.runtime.lastError) {
-            fallbackAnchorDownload(url, filename);
+            if (fallbackUrl) {
+              chrome.downloads.download({
+                url: fallbackUrl,
+                filename: filename,
+                saveAs: true
+              }, () => {
+                if (chrome.runtime.lastError) {
+                  fallbackAnchorDownload(fallbackUrl, filename);
+                }
+              });
+            } else {
+              fallbackAnchorDownload(url, filename);
+            }
           }
         });
       } else {
         fallbackAnchorDownload(url, filename);
       }
-    } catch (err) {
+    } catch {
       fallbackAnchorDownload(url, `image_${Date.now()}.jpg`);
     }
   }
@@ -1501,20 +1403,13 @@
     // 核心下载
     dom.btnDownloadZip.addEventListener('click', startBatchDownload);
 
-    // 深度穿透 (Deep Grab)
-    if (dom.btnDeepGrab) {
-      dom.btnDeepGrab.addEventListener('click', startDeepGrab);
-    }
-    if (dom.btnCancelDeepGrab) {
-      dom.btnCancelDeepGrab.addEventListener('click', () => {
-        state.deepGrabCancelRequested = true;
-        if (dom.deepGrabPhaseText) dom.deepGrabPhaseText.textContent = '正在中止穿透...';
-      });
-    }
-
     // 取消下载
     dom.btnCancelDownload.addEventListener('click', () => {
       state.cancelRequested = true;
+      if (state.quotaPauseResolver) {
+        state.quotaPauseResolver.resolve();
+        state.quotaPauseResolver = null;
+      }
       dom.consolePhaseText.textContent = '正在取消下载...';
     });
 
@@ -1536,7 +1431,7 @@
       if (e.key === 'Enter') activateLicenseKey();
     });
 
-    // 150MB 内存保护模态框
+    // 150MB 数据保护模态框
     dom.btnQuotaStopAndZip.addEventListener('click', () => resumeQuotaGuard(false));
     dom.btnQuotaContinue.addEventListener('click', () => resumeQuotaGuard(true));
 
@@ -1558,13 +1453,9 @@
       if (url) downloadSingleImage(url);
     });
 
-    // ESC 快捷键关闭弹窗 / 中止深度穿透
+    // ESC 快捷键关闭弹窗
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        if (state.isDeepGrabbing) {
-          state.deepGrabCancelRequested = true;
-          if (dom.deepGrabPhaseText) dom.deepGrabPhaseText.textContent = '正在中止穿透...';
-        }
         if (!dom.modalLightbox.classList.contains('hidden')) closeLightbox();
         if (!dom.modalPro.classList.contains('hidden')) closeProModal();
       }
