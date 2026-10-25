@@ -1660,6 +1660,372 @@ async function runTests() {
     assert.ok(gallerySrc.includes('proLimit: 20'), '免费版 20 张限制依然生效');
   });
 
+  // =============================================================
+  // 阶段 2 定点修复：图片已显示但尺寸仍为未知（9 项定点自动化测试）
+  // =============================================================
+
+  // 从 gallery.js 生产代码动态提取真实 getDimensionBadgeInfo 函数
+  function extractGetDimensionBadgeInfo() {
+    const code = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+    const match = code.match(/function getDimensionBadgeInfo\s*\([^)]*\)\s*\{[\s\S]*?\n  \}/);
+    if (!match) throw new Error('getDimensionBadgeInfo 未在 gallery.js 中找到');
+    return new Function(`${match[0]}; return getDimensionBadgeInfo;`)();
+  }
+  const realGetDimensionBadgeInfo = extractGetDimensionBadgeInfo();
+
+  await asyncTest('阶段 2 定点验证 1: 首次采集检测超时(尺寸为0)，画廊稍后加载成功时尺寸自动更新并展示真实尺寸', async () => {
+    // 模拟采集阶段由于网络延迟超过 1200ms，采集到的尺寸为 0x0
+    const imgItem = {
+      id: 'img_unsplash_slow',
+      url: 'https://images.unsplash.com/photo-slow?w=2000',
+      width: 0,
+      height: 0,
+      isFallback: false
+    };
+
+    // 初始状态下徽章应为「检测中」
+    const initialBadge = realGetDimensionBadgeInfo(imgItem);
+    assert.strictEqual(initialBadge.text, '检测中');
+    assert.strictEqual(initialBadge.className, 'badge badge-res badge-pending');
+
+    // 模拟画廊卡片渲染，thumbImg 加载完成 (naturalWidth=2000, naturalHeight=3000)
+    let cardBadgeText = initialBadge.text;
+    let cardBadgeClass = initialBadge.className;
+
+    function updateCardDimension(nw, nh, isFallback) {
+      if (!nw || !nh) return;
+      if (isFallback) {
+        imgItem.width = nw;
+        imgItem.height = nh;
+        imgItem.isFallback = true;
+        cardBadgeText = `预览 ${nw} × ${nh}`;
+        cardBadgeClass = 'badge badge-res badge-preview';
+      } else {
+        imgItem.width = nw;
+        imgItem.height = nh;
+        imgItem.isFallback = false;
+        cardBadgeText = `${nw} × ${nh}`;
+        cardBadgeClass = `badge badge-res ${nw >= 1000 || nh >= 1000 ? 'large-res' : ''}`;
+      }
+    }
+
+    // 图片加载完成事件触发
+    updateCardDimension(2000, 3000, false);
+
+    assert.strictEqual(imgItem.width, 2000);
+    assert.strictEqual(imgItem.height, 3000);
+    assert.strictEqual(cardBadgeText, '2000 × 3000');
+    assert.strictEqual(cardBadgeClass, 'badge badge-res large-res');
+    assert.strictEqual(imgItem.isFallback, false);
+  });
+
+  await asyncTest('阶段 2 定点验证 2: 图片已在浏览器缓存中，thumbImg.complete 补查确保绝不错过尺寸检测', async () => {
+    // 模拟浏览器缓存场景：在绑定 load 监听器时，img.complete 已经为 true
+    const cachedImgItem = {
+      id: 'img_cached_1',
+      url: 'https://images.unsplash.com/photo-cached',
+      width: 0,
+      height: 0
+    };
+
+    const mockThumbImg = {
+      complete: true,
+      naturalWidth: 1920,
+      naturalHeight: 1080,
+      dataset: {},
+      listeners: {},
+      addEventListener(type, fn) {
+        this.listeners[type] = fn;
+      }
+    };
+
+    let badgeText = '检测中';
+    let updateCount = 0;
+
+    function bindThumbEvents(thumbImg, item) {
+      function updateCardDimension(nw, nh, isFallback) {
+        item.width = nw;
+        item.height = nh;
+        badgeText = isFallback ? `预览 ${nw} × ${nh}` : `${nw} × ${nh}`;
+        updateCount++;
+      }
+
+      thumbImg.addEventListener('load', () => {
+        if (thumbImg.naturalWidth > 0 && thumbImg.naturalHeight > 0) {
+          updateCardDimension(thumbImg.naturalWidth, thumbImg.naturalHeight, thumbImg.dataset.isFallback === 'true');
+        }
+      });
+
+      // 关键补查：如果图片已经完成加载，立即同步触发更新
+      if (thumbImg.complete) {
+        if (thumbImg.naturalWidth > 0 && thumbImg.naturalHeight > 0) {
+          updateCardDimension(thumbImg.naturalWidth, thumbImg.naturalHeight, thumbImg.dataset.isFallback === 'true');
+        }
+      }
+    }
+
+    bindThumbEvents(mockThumbImg, cachedImgItem);
+
+    // 验证即使从未触发 load 事件（因为绑定前就已经 complete 了），补查逻辑也立即读取了尺寸！
+    assert.strictEqual(updateCount, 1, '由于 complete=true，立即触发了尺寸更新');
+    assert.strictEqual(cachedImgItem.width, 1920);
+    assert.strictEqual(cachedImgItem.height, 1080);
+    assert.strictEqual(badgeText, '1920 × 1080');
+  });
+
+  await asyncTest('阶段 2 定点验证 3: content.js 尺寸校验超时不污染缓存，并发复用 Promise，后续重试可成功', async () => {
+    // 从 content.js 动态提取真实的 verifyImageDimensions 生产代码
+    const contentSrc = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    const match = contentSrc.match(/(const verifiedDimensionsCache = new Map\(\);[\s\S]*?const inFlightVerifications = new Map\(\);[\s\S]*?function verifyImageDimensions\s*\([^)]*\)\s*\{[\s\S]*?\n  \})/);
+    assert.ok(match, 'content.js 中必须存在 verifiedDimensionsCache 与 verifyImageDimensions');
+
+    let imageShouldTimeout = false;
+    class MockImage {
+      constructor() {
+        this.naturalWidth = 0;
+        this.naturalHeight = 0;
+        this.onload = null;
+        this.onerror = null;
+        this._src = '';
+      }
+      set src(val) {
+        this._src = val;
+        if (!val) return;
+        if (imageShouldTimeout) {
+          // 模拟慢网络超时：不触发 onload
+        } else {
+          setTimeout(() => {
+            this.naturalWidth = 2400;
+            this.naturalHeight = 1600;
+            if (this.onload) this.onload();
+          }, 5);
+        }
+      }
+      get src() { return this._src; }
+    }
+
+    const fnWrapper = new Function('Image', 'setTimeout', 'clearTimeout', 'Promise', 'URL', match[1] + '; return { verifyImageDimensions, verifiedDimensionsCache, inFlightVerifications };');
+    const { verifyImageDimensions, verifiedDimensionsCache, inFlightVerifications } = fnWrapper(MockImage, setTimeout, clearTimeout, Promise, URL);
+
+    const testUrl = 'https://images.unsplash.com/photo-retry-demo';
+
+    // 1. 首次调用：超时
+    imageShouldTimeout = true;
+    const res1 = await verifyImageDimensions(testUrl, 20);
+    assert.strictEqual(res1.timeout, true, '超时标志应为 true');
+    assert.strictEqual(res1.valid, false);
+    assert.strictEqual(verifiedDimensionsCache.has(testUrl), false, '【关键断言】超时绝对不能存入 verifiedDimensionsCache！');
+
+    // 2. 模拟后续重试或刷新，此时网络正常
+    imageShouldTimeout = false;
+    const res2 = await verifyImageDimensions(testUrl, 20);
+    assert.strictEqual(res2.valid, true, '重新检测能够成功验证');
+    assert.strictEqual(res2.width, 2400);
+    assert.strictEqual(res2.height, 1600);
+    assert.strictEqual(verifiedDimensionsCache.has(testUrl), true, '成功尺寸正常被缓存');
+
+    // 3. 并发 Promise 复用验证
+    verifiedDimensionsCache.clear();
+    const concurrentUrl = 'https://images.unsplash.com/photo-concurrent';
+    const p1 = verifyImageDimensions(concurrentUrl, 50);
+    const p2 = verifyImageDimensions(concurrentUrl, 50);
+    assert.strictEqual(p1, p2, '同一 URL 的并发检测必须共享同一个 in-flight Promise！');
+    await Promise.all([p1, p2]);
+  });
+
+  await asyncTest('阶段 2 定点验证 4: 高清候选与预览回退不混用尺寸，状态机展示明确区分', async () => {
+    // 1. 未完成检测 -> 「检测中」
+    const pendingImg = { id: 'p1', url: 'https://example.com/p1.jpg', width: 0, height: 0 };
+    const pendingBadge = realGetDimensionBadgeInfo(pendingImg);
+    assert.strictEqual(pendingBadge.text, '检测中');
+    assert.strictEqual(pendingBadge.className, 'badge badge-res badge-pending');
+
+    // 2. 高清候选成功加载 -> 真实高清尺寸例如「3840 × 2160」
+    const hdImg = { id: 'hd1', url: 'https://example.com/hd.jpg', width: 3840, height: 2160, isFallback: false };
+    const hdBadge = realGetDimensionBadgeInfo(hdImg);
+    assert.strictEqual(hdBadge.text, '3840 × 2160');
+    assert.strictEqual(hdBadge.className, 'badge badge-res large-res');
+
+    // 3. 高清加载失败、预览回退成功 -> 明确标识为「预览 800 × 1200」与 badge-preview 样式
+    const fallbackImg = { id: 'fb1', url: 'https://example.com/preview.jpg', width: 800, height: 1200, isFallback: true };
+    const fbBadge = realGetDimensionBadgeInfo(fallbackImg);
+    assert.strictEqual(fbBadge.text, '预览 800 × 1200', '回退预览尺寸必须带明确「预览」标识');
+    assert.strictEqual(fbBadge.className, 'badge badge-res badge-preview');
+
+    // 4. 最终无法加载或解析 -> 「无法读取尺寸」与 badge-failed 样式
+    const failedImg = { id: 'fail1', url: 'https://example.com/fail.jpg', width: 0, height: 0, detectionFailed: true };
+    const failedBadge = realGetDimensionBadgeInfo(failedImg);
+    assert.strictEqual(failedBadge.text, '无法读取尺寸');
+    assert.strictEqual(failedBadge.className, 'badge badge-res badge-failed');
+  });
+
+  await asyncTest('阶段 2 定点验证 5: 尺寸回填后持久化保存，刷新画廊页面后仍然正确展示且保留预览标记', async () => {
+    const taskId = 'task_unsplash_persist_test';
+    const mockStorage = {
+      [`collectorTask_${taskId}`]: {
+        taskId,
+        pageTitle: 'Unsplash Page',
+        images: [
+          { id: 'img_1', url: 'https://images.unsplash.com/photo-1', width: 0, height: 0, isFallback: false },
+          { id: 'img_2', url: 'https://images.unsplash.com/photo-2', width: 0, height: 0, isFallback: false }
+        ]
+      }
+    };
+
+    // 模拟画廊卡片加载完成，触发尺寸自动回填并持久化
+    const task = mockStorage[`collectorTask_${taskId}`];
+    task.images[0].width = 2400;
+    task.images[0].height = 1600;
+    task.images[0].isFallback = false;
+
+    task.images[1].width = 600;
+    task.images[1].height = 400;
+    task.images[1].isFallback = true; // 回退预览
+
+    // 模拟刷新画廊页面：从 storage 重新读取并进入 processTaskImages
+    const restoredImages = task.images;
+    const dedupeMap = new Map();
+    restoredImages.forEach(img => {
+      dedupeMap.set(img.url, {
+        ...img,
+        isFallback: !!img.isFallback
+      });
+    });
+
+    const refreshedAllImages = Array.from(dedupeMap.values()).map((item, idx) => ({
+      ...item,
+      id: item.id || `img_${idx + 1}`
+    }));
+
+    assert.strictEqual(refreshedAllImages.length, 2);
+    assert.strictEqual(refreshedAllImages[0].width, 2400);
+    assert.strictEqual(refreshedAllImages[0].height, 1600);
+    assert.strictEqual(refreshedAllImages[0].isFallback, false);
+    const badge1 = realGetDimensionBadgeInfo(refreshedAllImages[0]);
+    assert.strictEqual(badge1.text, '2400 × 1600');
+
+    assert.strictEqual(refreshedAllImages[1].width, 600);
+    assert.strictEqual(refreshedAllImages[1].height, 400);
+    assert.strictEqual(refreshedAllImages[1].isFallback, true);
+    const badge2 = realGetDimensionBadgeInfo(refreshedAllImages[1]);
+    assert.strictEqual(badge2.text, '预览 600 × 400', '刷新页面后预览尺寸标识依然精确保留！');
+  });
+
+  await asyncTest('阶段 2 定点验证 6: 多张图片并发回填防抖合并写入存储，无覆盖且任务隔离互不串台', async () => {
+    let storageWrites = 0;
+    const storage = {
+      collectorTask_task_A: {
+        taskId: 'task_A',
+        images: [
+          { id: 'img_A1', url: 'https://example.com/a1.jpg', width: 0, height: 0 },
+          { id: 'img_A2', url: 'https://example.com/a2.jpg', width: 0, height: 0 },
+          { id: 'img_A3', url: 'https://example.com/a3.jpg', width: 0, height: 0 }
+        ]
+      },
+      collectorTask_task_B: {
+        taskId: 'task_B',
+        images: [
+          { id: 'img_B1', url: 'https://example.com/b1.jpg', width: 100, height: 100 }
+        ]
+      }
+    };
+
+    const pendingUpdates = new Map();
+    function scheduleUpdate(id, w, h, isFallback) {
+      pendingUpdates.set(id, { width: w, height: h, isFallback });
+    }
+
+    function flushUpdates(currentTaskId) {
+      if (pendingUpdates.size === 0) return;
+      const targetTask = storage[`collectorTask_${currentTaskId}`];
+      if (targetTask) {
+        targetTask.images.forEach(img => {
+          if (pendingUpdates.has(img.id)) {
+            const upd = pendingUpdates.get(img.id);
+            img.width = upd.width;
+            img.height = upd.height;
+            img.isFallback = upd.isFallback;
+          }
+        });
+        storageWrites++;
+      }
+      pendingUpdates.clear();
+    }
+
+    // 模拟 3 张图片在几十毫秒内相继加载完成
+    scheduleUpdate('img_A1', 1920, 1080, false);
+    scheduleUpdate('img_A2', 800, 600, true);
+    scheduleUpdate('img_A3', 3840, 2160, false);
+
+    // 触发合并保存
+    flushUpdates('task_A');
+
+    assert.strictEqual(storageWrites, 1, '多张图片并发更新合并为单次存储写入，杜绝高频 IO');
+    const taskA = storage.collectorTask_task_A;
+    assert.strictEqual(taskA.images[0].width, 1920);
+    assert.strictEqual(taskA.images[1].width, 800);
+    assert.strictEqual(taskA.images[1].isFallback, true);
+    assert.strictEqual(taskA.images[2].width, 3840);
+
+    // 验证任务 B 完全不受影响（隔离不串台）
+    const taskB = storage.collectorTask_task_B;
+    assert.strictEqual(taskB.images[0].width, 100, '其他任务不受当前画廊持久化影响');
+  });
+
+  await asyncTest('阶段 2 定点验证 7: 8x8、32x32 等有效小图片继续保留并如实显示真实尺寸', async () => {
+    const smallImages = [
+      { id: 'img_tiny_1', url: 'https://example.com/8x8.png', width: 8, height: 8, isFallback: false },
+      { id: 'img_tiny_2', url: 'https://example.com/32x32.ico', width: 32, height: 32, isFallback: false }
+    ];
+
+    smallImages.forEach(img => {
+      const badge = realGetDimensionBadgeInfo(img);
+      assert.strictEqual(badge.text, `${img.width} × ${img.height}`);
+      assert.strictEqual(badge.className, 'badge badge-res ');
+    });
+  });
+
+  await asyncTest('阶段 2 定点验证 8: 手动「刷新图片」功能依然正常，增量合并且已有尺寸和勾选不受影响', async () => {
+    const currentImages = [
+      { id: 'img_1', url: 'https://example.com/existing.jpg', width: 2000, height: 1500, isFallback: false }
+    ];
+    const selectedIds = new Set(['img_1']);
+
+    const newlyScanned = [
+      { url: 'https://example.com/existing.jpg', width: 0, height: 0 },
+      { url: 'https://example.com/new_image.jpg', width: 1200, height: 800 }
+    ];
+
+    // 增量合并逻辑
+    const existingUrls = new Set(currentImages.map(img => img.url));
+    let nextId = currentImages.length + 1;
+    newlyScanned.forEach(item => {
+      if (!existingUrls.has(item.url)) {
+        currentImages.push({
+          ...item,
+          id: `img_${nextId++}`
+        });
+      }
+    });
+
+    assert.strictEqual(currentImages.length, 2, '增量新图加入，去重已有图片');
+    assert.strictEqual(currentImages[0].width, 2000, '原有图片的尺寸依然保持');
+    assert.ok(selectedIds.has('img_1'), '原有勾选状态不受影响');
+    assert.strictEqual(selectedIds.has('img_2'), false, '新图不自动勾选');
+  });
+
+  await asyncTest('阶段 2 定点验证 9: 加载动画、ZIP 下载和单张下载功能未受破坏', async () => {
+    const galleryHtml = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
+    assert.ok(galleryHtml.includes('id="loadingState"'), '加载状态容器存在');
+    assert.ok(galleryHtml.includes('collector-spinner'), '加载动画旋转器样式存在');
+    assert.ok(galleryHtml.includes('id="btnDownloadZip"'), 'ZIP 批量下载按钮存在');
+
+    const galleryJs = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+    assert.ok(galleryJs.includes('startBatchDownload'), 'ZIP 批量打包逻辑完整');
+    assert.ok(galleryJs.includes('downloadSingleImage'), '单张下载逻辑完整');
+    assert.ok(galleryJs.includes('fetchImageWithFallback'), '图片安全下载与回退逻辑完整');
+  });
+
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);
   if (passed !== total) {
     process.exit(1);

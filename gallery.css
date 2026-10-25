@@ -806,6 +806,24 @@ body.dark-theme {
   border-color: rgba(245, 158, 11, 0.3);
 }
 
+.badge-res.badge-preview {
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+  border-color: rgba(168, 85, 247, 0.3);
+}
+
+.badge-res.badge-pending {
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+.badge-res.badge-failed {
+  background: rgba(244, 63, 94, 0.12);
+  color: #f43f5e;
+  border-color: rgba(244, 63, 94, 0.25);
+}
+
 .badge-fmt {
   background: rgba(255, 255, 255, 0.08);
   color: var(--text-muted);

@@ -662,6 +662,7 @@
           existing.width = Math.max(existing.width || 0, img.width || 0);
           existing.height = Math.max(existing.height || 0, img.height || 0);
         }
+        if (img.isFallback !== undefined) existing.isFallback = img.isFallback;
         if (!existing.alt && img.alt) existing.alt = img.alt;
         if (!existing.fallbackUrl && fallbackUrl) existing.fallbackUrl = fallbackUrl;
         if (!existing.originalUrl && originalUrl) existing.originalUrl = originalUrl;
@@ -676,7 +677,8 @@
           originalUrl: originalUrl, // 保留原始未增强地址用于下载失败自动回退
           fallbackUrl: fallbackUrl, // 保留 DOM 级主图降级地址
           detailUrl: img.detailUrl || null,
-          hasDetailLink: !!img.detailUrl
+          hasDetailLink: !!img.detailUrl,
+          isFallback: !!img.isFallback
         });
       }
     });
@@ -685,7 +687,7 @@
     // 保证画廊展示、多选集合、下载队列、卡片 UI 状态与错误报告一一对应，杜绝增强后 URL 相同导致的覆盖
     state.allImages = Array.from(dedupeMap.values()).map((item, idx) => ({
       ...item,
-      id: `img_${idx + 1}`
+      id: item.id || `img_${idx + 1}`
     }));
 
     // 默认全选前 20 张（或全部若小于 20 张）
@@ -1069,6 +1071,100 @@
   // -------------------------------------------------------------
   // 5. 过滤与画廊渲染
   // -------------------------------------------------------------
+
+  /**
+   * 尺寸标签展示逻辑（状态机明确区分：检测中、真实分辨率、回退预览、无法读取尺寸）
+   */
+  function getDimensionBadgeInfo(img) {
+    if (img.width > 0 && img.height > 0) {
+      if (img.isFallback) {
+        return {
+          text: `预览 ${img.width} × ${img.height}`,
+          className: 'badge badge-res badge-preview'
+        };
+      }
+      const isLarge = (img.width >= 1000 || img.height >= 1000);
+      return {
+        text: `${img.width} × ${img.height}`,
+        className: `badge badge-res ${isLarge ? 'large-res' : ''}`
+      };
+    }
+    if (img.detectionFailed) {
+      return {
+        text: '无法读取尺寸',
+        className: 'badge badge-res badge-failed'
+      };
+    }
+    return {
+      text: '检测中',
+      className: 'badge badge-res badge-pending'
+    };
+  }
+
+  // 尺寸变更防抖合并持久化队列 (多张图片同时加载完成时合并写入 storage，避免高频 IO)
+  const pendingDimensionUpdates = new Map(); // id -> { width, height, isFallback }
+  let dimensionPersistTimer = null;
+
+  function schedulePersistImageDimensions(id, width, height, isFallback = false) {
+    pendingDimensionUpdates.set(id, { width, height, isFallback: !!isFallback });
+
+    if (dimensionPersistTimer) {
+      clearTimeout(dimensionPersistTimer);
+    }
+    dimensionPersistTimer = setTimeout(flushPersistImageDimensions, 300);
+  }
+
+  async function flushPersistImageDimensions() {
+    if (pendingDimensionUpdates.size === 0) return;
+    const updatesToApply = new Map(pendingDimensionUpdates);
+    pendingDimensionUpdates.clear();
+
+    try {
+      // 1. 同步内存中 state.allImages 数据
+      let hasChanges = false;
+      state.allImages.forEach(img => {
+        if (updatesToApply.has(img.id)) {
+          const upd = updatesToApply.get(img.id);
+          if (img.width !== upd.width || img.height !== upd.height || img.isFallback !== upd.isFallback) {
+            img.width = upd.width;
+            img.height = upd.height;
+            img.isFallback = upd.isFallback;
+            hasChanges = true;
+          }
+        }
+      });
+
+      // 2. 持久化到专属 collectorTask_${taskId} 与兼容入口 currentCollectorTask
+      const storageKey = state.taskId ? `collectorTask_${state.taskId}` : 'currentCollectorTask';
+      const keysToGet = state.taskId ? [storageKey, 'currentCollectorTask'] : ['currentCollectorTask'];
+
+      const res = await chrome.storage.local.get(keysToGet);
+      const updates = {};
+
+      if (state.taskId && res && res[storageKey]) {
+        const task = res[storageKey];
+        task.images = state.allImages;
+        updates[storageKey] = task;
+      }
+      if (res && res.currentCollectorTask) {
+        const currentTask = res.currentCollectorTask;
+        const isSameTask = (!state.taskId || currentTask.taskId === state.taskId) ||
+          ((!state.taskCollectedAt || currentTask.collectedAt === state.taskCollectedAt)
+          && (!state.pageUrl || currentTask.pageUrl === state.pageUrl));
+        if (isSameTask) {
+          currentTask.images = state.allImages;
+          updates.currentCollectorTask = currentTask;
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await chrome.storage.local.set(updates);
+      }
+    } catch (err) {
+      console.warn('[Gallery] 批量保存图片尺寸失败:', err);
+    }
+  }
+
   function applyFilters() {
     state.filteredImages = state.allImages.filter(img => {
       // 宽度过滤
@@ -1115,8 +1211,7 @@
       card.dataset.url = img.url;
 
       const format = detectImageFormat(img);
-      const isLarge = (img.width >= 1000 || img.height >= 1000);
-      const resText = (img.width > 0 && img.height > 0) ? `${img.width} × ${img.height}` : '未知尺寸';
+      const badgeInfo = getDimensionBadgeInfo(img);
 
       // 遵守 MV3 CSP: 不在 innerHTML 中使用内联 onerror 事件属性
       card.innerHTML = `
@@ -1152,41 +1247,105 @@
 
         <div class="card-meta">
           <div class="meta-badges">
-            <span class="badge badge-res ${isLarge ? 'large-res' : ''}">${resText}</span>
+            <span class="${badgeInfo.className}">${badgeInfo.text}</span>
             <span class="badge badge-fmt">${format}</span>
           </div>
           <span class="badge" style="font-size: 10px; color: var(--text-dim);">${img.source || 'img'}</span>
         </div>
       `;
 
-      // 修复 2：通过纯 JS 事件绑定实现高清预览失败时回退原始地址，杜绝内联 onerror 违反 CSP，防止无限回退
+      // 纯 JS 事件绑定与尺寸自动回填：可靠处理缓存图片、错峰加载及回退预览区分
       const thumbImg = card.querySelector('.card-thumb-wrapper img');
       const fallbackCandidate = (img.originalUrl && img.originalUrl !== img.url)
         ? img.originalUrl
         : (img.fallbackUrl && img.fallbackUrl !== img.url ? img.fallbackUrl : null);
 
       if (thumbImg) {
-        // 当图片在画廊卡片中成功渲染时，若原始尺寸未知，通过天然 naturalWidth/naturalHeight 动态更新真实尺寸
-        thumbImg.addEventListener('load', function onThumbLoaded() {
-          if ((!img.width || !img.height) && this.naturalWidth > 0 && this.naturalHeight > 0) {
-            img.width = this.naturalWidth;
-            img.height = this.naturalHeight;
-            const resBadge = card.querySelector('.badge-res');
-            if (resBadge) {
-              resBadge.textContent = `${img.width} × ${img.height}`;
-              if (img.width >= 1000 || img.height >= 1000) {
-                resBadge.classList.add('large-res');
-              }
+        function updateCardDimension(nw, nh, isFallback) {
+          if (!nw || !nh) return;
+
+          if (isFallback) {
+            img.previewWidth = nw;
+            img.previewHeight = nh;
+            img.isFallback = true;
+            if (!img.width || !img.height) {
+              img.width = nw;
+              img.height = nh;
+            }
+          } else {
+            img.width = nw;
+            img.height = nh;
+            img.isFallback = false;
+          }
+
+          const resBadge = card.querySelector('.badge-res');
+          if (resBadge) {
+            if (isFallback) {
+              resBadge.textContent = `预览 ${nw} × ${nh}`;
+              resBadge.className = 'badge badge-res badge-preview';
+            } else {
+              resBadge.textContent = `${nw} × ${nh}`;
+              resBadge.className = `badge badge-res ${nw >= 1000 || nh >= 1000 ? 'large-res' : ''}`;
             }
           }
-        }, { once: true });
 
-        if (fallbackCandidate) {
-          thumbImg.addEventListener('error', function onThumbError() {
-            if (this.dataset.fallbackAttempted === 'true') return;
-            this.dataset.fallbackAttempted = 'true';
-            this.src = fallbackCandidate;
-          }, { once: true });
+          // 批量防抖持久化到 storage，避免高频写入
+          schedulePersistImageDimensions(img.id, img.width, img.height, img.isFallback);
+        }
+
+        function onThumbLoad() {
+          const nw = thumbImg.naturalWidth || 0;
+          const nh = thumbImg.naturalHeight || 0;
+          if (nw > 0 && nh > 0) {
+            const isFallback = thumbImg.dataset.isFallback === 'true';
+            updateCardDimension(nw, nh, isFallback);
+          }
+        }
+
+        function onThumbError() {
+          if (thumbImg.dataset.fallbackAttempted === 'true') {
+            // 回退预览也加载失败
+            img.detectionFailed = true;
+            const resBadge = card.querySelector('.badge-res');
+            if (resBadge && (!img.width || !img.height)) {
+              resBadge.textContent = '无法读取尺寸';
+              resBadge.className = 'badge badge-res badge-failed';
+            }
+            return;
+          }
+
+          if (fallbackCandidate) {
+            thumbImg.dataset.fallbackAttempted = 'true';
+            thumbImg.dataset.isFallback = 'true';
+            thumbImg.src = fallbackCandidate;
+            // 补查回退图片是否已在缓存中完成加载
+            if (thumbImg.complete) {
+              if (thumbImg.naturalWidth > 0 && thumbImg.naturalHeight > 0) {
+                updateCardDimension(thumbImg.naturalWidth, thumbImg.naturalHeight, true);
+              } else {
+                onThumbError();
+              }
+            }
+          } else {
+            img.detectionFailed = true;
+            const resBadge = card.querySelector('.badge-res');
+            if (resBadge && (!img.width || !img.height)) {
+              resBadge.textContent = '无法读取尺寸';
+              resBadge.className = 'badge badge-res badge-failed';
+            }
+          }
+        }
+
+        thumbImg.addEventListener('load', onThumbLoad);
+        thumbImg.addEventListener('error', onThumbError);
+
+        // 关键时序检查：补查图片是否已经在浏览器缓存中完成加载（杜绝错过 load 事件）
+        if (thumbImg.complete) {
+          if (thumbImg.naturalWidth > 0 && thumbImg.naturalHeight > 0) {
+            updateCardDimension(thumbImg.naturalWidth, thumbImg.naturalHeight, thumbImg.dataset.isFallback === 'true');
+          } else if (thumbImg.naturalWidth === 0 && thumbImg.src) {
+            onThumbError();
+          }
         }
       }
 
@@ -2409,35 +2568,64 @@
   }
 
   let lightboxErrorHandler = null;
+  let lightboxLoadHandler = null;
 
   function openLightbox(imgItem) {
     dom.lightboxImg.dataset.id = imgItem.id || '';
-    dom.lightboxResolution.textContent = (imgItem.width && imgItem.height) ? `${imgItem.width} × ${imgItem.height}` : '未知尺寸';
+    const badgeInfo = getDimensionBadgeInfo(imgItem);
+    dom.lightboxResolution.textContent = badgeInfo.text;
     dom.lightboxFormat.textContent = detectImageFormat(imgItem);
     dom.lightboxUrl.textContent = imgItem.url;
 
-    // 清理旧的错误监听器
+    // 清理旧的监听器
     if (lightboxErrorHandler) {
       dom.lightboxImg.removeEventListener('error', lightboxErrorHandler);
       lightboxErrorHandler = null;
     }
+    if (lightboxLoadHandler) {
+      dom.lightboxImg.removeEventListener('load', lightboxLoadHandler);
+      lightboxLoadHandler = null;
+    }
 
-    // 修复 2：大图预览失败时通过纯 JS 事件监听器安全回退原始地址，杜绝内联属性且防止死循环
     const fallbackCandidate = (imgItem.originalUrl && imgItem.originalUrl !== imgItem.url)
       ? imgItem.originalUrl
       : (imgItem.fallbackUrl && imgItem.fallbackUrl !== imgItem.url ? imgItem.fallbackUrl : null);
 
+    lightboxLoadHandler = function () {
+      const nw = dom.lightboxImg.naturalWidth;
+      const nh = dom.lightboxImg.naturalHeight;
+      if (nw > 0 && nh > 0) {
+        const isFallback = dom.lightboxImg.dataset.isFallback === 'true';
+        if (isFallback) {
+          dom.lightboxResolution.textContent = `预览 ${nw} × ${nh}`;
+        } else {
+          dom.lightboxResolution.textContent = `${nw} × ${nh}`;
+        }
+      }
+    };
+    dom.lightboxImg.addEventListener('load', lightboxLoadHandler);
+
     if (fallbackCandidate) {
       lightboxErrorHandler = function () {
         if (dom.lightboxImg.src !== fallbackCandidate) {
+          dom.lightboxImg.dataset.isFallback = 'true';
           dom.lightboxImg.src = fallbackCandidate;
           dom.lightboxUrl.textContent = fallbackCandidate;
+          if (dom.lightboxImg.complete && dom.lightboxImg.naturalWidth > 0) {
+            lightboxLoadHandler();
+          }
         }
       };
       dom.lightboxImg.addEventListener('error', lightboxErrorHandler, { once: true });
     }
 
+    dom.lightboxImg.dataset.isFallback = imgItem.isFallback ? 'true' : 'false';
     dom.lightboxImg.src = imgItem.url;
+
+    if (dom.lightboxImg.complete && dom.lightboxImg.naturalWidth > 0) {
+      lightboxLoadHandler();
+    }
+
     dom.modalLightbox.classList.remove('hidden');
   }
 
@@ -2447,8 +2635,13 @@
       dom.lightboxImg.removeEventListener('error', lightboxErrorHandler);
       lightboxErrorHandler = null;
     }
+    if (lightboxLoadHandler) {
+      dom.lightboxImg.removeEventListener('load', lightboxLoadHandler);
+      lightboxLoadHandler = null;
+    }
     dom.lightboxImg.src = '';
     dom.lightboxImg.dataset.id = '';
+    dom.lightboxImg.dataset.isFallback = 'false';
   }
 
   // -------------------------------------------------------------
@@ -2654,6 +2847,11 @@
         if (!dom.modalLightbox.classList.contains('hidden')) closeLightbox();
         if (!dom.modalPro.classList.contains('hidden')) closeProModal();
       }
+    });
+
+    // 页面刷新或关闭时，立即冲刷未保存的图片尺寸持久化数据
+    window.addEventListener('beforeunload', () => {
+      flushPersistImageDimensions();
     });
   }
 

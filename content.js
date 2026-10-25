@@ -194,35 +194,44 @@
     return { directImageUrl: null, detailUrl: absHref };
   }
 
-  // 内存级 URL 尺寸校验缓存：避免同页面或刷新时重复发起网络请求与 Image 构造
-  const verifiedDimensionsCache = new Map(); // url -> { width, height, valid, timeout }
+  // 内存级 URL 尺寸有效缓存：仅缓存确凿校验成功的真实尺寸结果，杜绝缓存超时污染
+  const verifiedDimensionsCache = new Map(); // url -> { width, height, valid: true }
+
+  // 运行期正在进行中的并发请求复用池：避免同一 URL 并发重复发起网络请求
+  const inFlightVerifications = new Map(); // url -> Promise<{ width, height, valid, timeout }>
 
   /**
-   * 异步验证图片真实分辨率，优先复用已验证缓存，带超时控制与错误捕获
+   * 异步验证图片真实分辨率，优先复用已验证成功缓存与并发 Promise，带超时控制与错误捕获
    */
   function verifyImageDimensions(url, timeoutMs = 1200) {
-    return new Promise((resolve) => {
-      if (!url) return resolve({ width: 0, height: 0, valid: false });
+    if (!url) return Promise.resolve({ width: 0, height: 0, valid: false });
 
-      // 1. 命中缓存直接返回，杜绝二次请求
-      if (verifiedDimensionsCache.has(url)) {
-        return resolve(verifiedDimensionsCache.get(url));
+    // 1. 成功缓存命中：仅当拥有真实正向尺寸时直接返回，杜绝二次请求
+    if (verifiedDimensionsCache.has(url)) {
+      const cached = verifiedDimensionsCache.get(url);
+      if (cached && cached.valid && cached.width > 0 && cached.height > 0) {
+        return Promise.resolve(cached);
       }
+    }
 
-      // 快速剔除无效或 1x1 base64 占位图
-      if (url.startsWith('data:')) {
-        if (url.includes('R0lGODlhAQABA') || url.includes('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB') || url.length < 200) {
-          const res = { width: 0, height: 0, valid: false };
-          verifiedDimensionsCache.set(url, res);
-          return resolve(res);
-        }
+    // 2. 快速剔除无效或 1x1 base64 占位图
+    if (url.startsWith('data:')) {
+      if (url.includes('R0lGODlhAQABA') || url.includes('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB') || url.length < 200) {
+        return Promise.resolve({ width: 0, height: 0, valid: false });
       }
+    }
 
-      // 如果运行在 Node.js 环境或缺失 Image 构造器
-      if (typeof Image === 'undefined') {
-        return resolve({ width: 0, height: 0, valid: true });
-      }
+    // 3. 如果运行在 Node.js 环境或缺失 Image 构造器
+    if (typeof Image === 'undefined') {
+      return Promise.resolve({ width: 0, height: 0, valid: true });
+    }
 
+    // 4. 并发请求去重复用：若当前 URL 正处于网络检测队列中，共享同一个 Promise
+    if (inFlightVerifications.has(url)) {
+      return inFlightVerifications.get(url);
+    }
+
+    const verificationPromise = new Promise((resolve) => {
       const img = new Image();
       let timer = null;
       let settled = false;
@@ -234,9 +243,14 @@
         img.onload = null;
         img.onerror = null;
         try { img.src = ''; } catch {}
+
+        inFlightVerifications.delete(url);
+
         const result = { width: w, height: h, valid, timeout };
-        if (valid || timeout) {
-          verifiedDimensionsCache.set(url, result);
+        // 【关键修复】：仅在确凿校验成功且长宽大于 0 时记录持久缓存！
+        // 超时或失败绝不永久缓存，确保后续重试或刷新时仍有重新检测的机会！
+        if (valid && w > 0 && h > 0) {
+          verifiedDimensionsCache.set(url, { width: w, height: h, valid: true });
         }
         resolve(result);
       };
@@ -248,7 +262,7 @@
       img.onload = () => {
         const nw = img.naturalWidth || 0;
         const nh = img.naturalHeight || 0;
-        finish(nw, nh, true, false);
+        finish(nw, nh, nw > 0 && nh > 0, false);
       };
 
       img.onerror = () => {
@@ -257,10 +271,17 @@
 
       try {
         img.src = url;
+        // 补查：如果图片已经在浏览器本地缓存中完成加载，立即返回真实尺寸
+        if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+          finish(img.naturalWidth, img.naturalHeight, true, false);
+        }
       } catch {
         finish(0, 0, false, false);
       }
     });
+
+    inFlightVerifications.set(url, verificationPromise);
+    return verificationPromise;
   }
 
   /**
