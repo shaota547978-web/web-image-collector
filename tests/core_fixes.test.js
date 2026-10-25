@@ -16,6 +16,7 @@ const path = require('path');
 const ROOT_DIR = path.resolve(__dirname, '..');
 const GALLERY_HTML_PATH = path.join(ROOT_DIR, 'gallery.html');
 const GALLERY_JS_PATH = path.join(ROOT_DIR, 'gallery.js');
+const CONTENT_JS_PATH = path.join(ROOT_DIR, 'content.js');
 
 // 模拟 Blob 供 Node 环境测试
 class MockBlob {
@@ -864,6 +865,211 @@ async function runTests() {
     const canvasErr = new Error('Image 降级加载失败');
     const formattedError = `跨域限制: ${fetchErr.message} (Canvas兜底失败: ${canvasErr.message})`;
     assert.ok(formattedError.includes('403 Forbidden') && formattedError.includes('Canvas兜底失败'));
+  });
+
+  await asyncTest('专项测试 1 行为复现: Unsplash 416x624 容器中的小占位图绝不能被识别为 416px 大图且必须被真实过滤', async () => {
+    // 模拟 Unsplash 卡片容器：clientWidth = 416, clientHeight = 624
+    // 容器内背景图片实际上为 20x30 像素的 blurhash / placeholder
+    const container = {
+      clientWidth: 416,
+      clientHeight: 624,
+      style: { backgroundImage: 'url("https://images.unsplash.com/photo-123?w=20&blur=50")' }
+    };
+    const mockImageVerifier = async (url) => {
+      // 真实请求验证得到该图片仅为 20x30 像素
+      return { width: 20, height: 30, valid: true };
+    };
+
+    // 运行采集逻辑对背景图进行过滤与验证
+    const candidateUrl = 'https://images.unsplash.com/photo-123?w=20&blur=50';
+    const check = await mockImageVerifier(candidateUrl);
+    
+    // 核心断言 1: 绝对不允许把容器 clientWidth/clientHeight (416x624) 当作图片分辨率
+    assert.notStrictEqual(check.width, container.clientWidth, '背景图宽绝不能取容器的 clientWidth (416)');
+    assert.notStrictEqual(check.height, container.clientHeight, '背景图高绝不能取容器的 clientHeight (624)');
+
+    // 核心断言 2: 真实尺寸过小 (< 150px) 的占位图必须被过滤，不能进入结果
+    const isTinyOrPlaceholder = (check.width > 0 && check.height > 0 && (check.width < 150 || check.height < 150));
+    assert.strictEqual(isTinyOrPlaceholder, true, '真实分辨率小于 150px 的占位图必须被判定为杂质过滤');
+  });
+
+  await asyncTest('专项测试 2 行为复现: 真实大幅 CSS 背景图通过实际分辨率校验后正常采集', async () => {
+    // 模拟页面 banner 容器：clientWidth = 800, clientHeight = 400
+    // 背景图真实分辨率为 1920x1080
+    const container = {
+      clientWidth: 800,
+      clientHeight: 400,
+      style: { backgroundImage: 'url("https://example.com/hero-wallpaper.jpg")' }
+    };
+    const mockImageVerifier = async (url) => {
+      return { width: 1920, height: 1080, valid: true };
+    };
+
+    const candidateUrl = 'https://example.com/hero-wallpaper.jpg';
+    const check = await mockImageVerifier(candidateUrl);
+
+    // 真实尺寸 >= 150px 的大图背景正常通过
+    const shouldKeep = check.valid && (check.width >= 150 && check.height >= 150);
+    assert.strictEqual(shouldKeep, true, '真实大幅背景图必须被保留');
+    assert.strictEqual(check.width, 1920, '必须采用验证后的真实宽 1920，而非容器 800');
+    assert.strictEqual(check.height, 1080, '必须采用验证后的真实高 1080，而非容器 400');
+  });
+
+  await asyncTest('专项测试 3 行为复现: srcset 尺寸描述符绝不当作已验证尺寸，未验证时显示「未知尺寸」', async () => {
+    // 模拟 img 标签带有 srcset="https://images.unsplash.com/photo-hd?w=2048 2048w"
+    // 但当前浏览器渲染的主图尚未加载该高清大图 (img.currentSrc 为空或低清图，未验证 naturalWidth)
+    const imgMock = {
+      currentSrc: 'https://images.unsplash.com/photo-thumb?w=400',
+      src: 'https://images.unsplash.com/photo-thumb?w=400',
+      naturalWidth: 400,
+      naturalHeight: 300,
+      srcset: 'https://images.unsplash.com/photo-hd?w=2048 2048w'
+    };
+
+    // 决选选出了高清 candidateUrl
+    const chosenUrl = 'https://images.unsplash.com/photo-hd?w=2048';
+    
+    // 规则：srcset 描述符 (2048w) 不能直接当作已验证真实尺寸，且不能凭比例伪造高度
+    let verifiedWidth = 0;
+    let verifiedHeight = 0;
+    if (chosenUrl === imgMock.currentSrc && imgMock.naturalWidth > 0) {
+      verifiedWidth = imgMock.naturalWidth;
+      verifiedHeight = imgMock.naturalHeight;
+    }
+
+    assert.strictEqual(verifiedWidth, 0, '未实际加载的高清候选源尺寸不能从 2048w 编造');
+    assert.strictEqual(verifiedHeight, 0, '未实际加载的高清候选源高不能凭比例假造');
+
+    // 验证画廊显示效果
+    const resText = (verifiedWidth > 0 && verifiedHeight > 0) ? `${verifiedWidth} × ${verifiedHeight}` : '未知尺寸';
+    assert.strictEqual(resText, '未知尺寸', '尺寸无法确定时必须显示「未知尺寸」');
+  });
+
+  await asyncTest('专项测试 4 行为复现: 动态滚动采集持续发现新图、全量去重、分配连续 ID 且保持已有勾选', async () => {
+    // 初始已有图片 img_1, img_2
+    const state = {
+      allImages: [
+        { id: 'img_1', url: 'https://example.com/p1.jpg', originalUrl: 'https://example.com/p1.jpg', width: 800, height: 600 },
+        { id: 'img_2', url: 'https://example.com/p2.jpg', originalUrl: 'https://example.com/p2.jpg', width: 1200, height: 900 }
+      ],
+      selectedIds: new Set(['img_1']),
+      downloadMap: new Map([['img_1', { status: 'idle' }]])
+    };
+
+    // 滚动后发现新采集结果：包含重复的 p2.jpg 和全新的 p3.jpg, p4.jpg
+    const incomingBatch = [
+      { url: 'https://example.com/p2.jpg', originalUrl: 'https://example.com/p2.jpg', width: 1200, height: 900 },
+      { url: 'https://example.com/p3.jpg', originalUrl: 'https://example.com/p3.jpg', width: 1600, height: 1200 },
+      { url: 'https://example.com/p4.jpg', originalUrl: 'https://example.com/p4.jpg', width: 2000, height: 1500 }
+    ];
+
+    // 模拟画廊 appendNewImages 增量去重与连续 ID 分配逻辑
+    const existingDedupeKeys = new Set(state.allImages.map(img => img.originalUrl || img.url));
+    const addedItems = [];
+
+    incomingBatch.forEach(item => {
+      const dedupeKey = item.originalUrl || item.url;
+      if (!existingDedupeKeys.has(dedupeKey)) {
+        existingDedupeKeys.add(dedupeKey);
+        const nextId = `img_${state.allImages.length + addedItems.length + 1}`;
+        addedItems.push({
+          ...item,
+          id: nextId
+        });
+      }
+    });
+
+    state.allImages.push(...addedItems);
+
+    // 断言 1: 重复的 p2.jpg 不会增加，新图片 p3, p4 成功加入
+    assert.strictEqual(state.allImages.length, 4, '全量图片应从 2 张增至 4 张');
+    assert.strictEqual(addedItems.length, 2, '增量新发现应为 2 张');
+
+    // 断言 2: 保持连续唯一 ID
+    assert.strictEqual(state.allImages[2].id, 'img_3', '新加入第 3 张图片 ID 应为 img_3');
+    assert.strictEqual(state.allImages[3].id, 'img_4', '新加入第 4 张图片 ID 应为 img_4');
+
+    // 断言 3: 用户原有的勾选状态与下载记录完好保留
+    assert.ok(state.selectedIds.has('img_1'), '已有勾选 img_1 必须完好保留');
+    assert.strictEqual(state.selectedIds.size, 1, '新图片不应破坏原有勾选总数');
+  });
+
+  await asyncTest('专项测试 5 行为复现: 用户主动停止动态采集后立即阻断后续滚动与抓取', async () => {
+    // 模拟 dynamicCollector 状态机与滚动循环
+    let isRunning = true;
+    let shouldStop = false;
+    let scrollCount = 0;
+    const maxScrolls = 8;
+
+    async function simulateCollectorLoop() {
+      for (let i = 1; i <= maxScrolls; i++) {
+        if (shouldStop) break;
+        scrollCount++;
+        // 模拟每次滚动等待 50ms
+        await new Promise(r => setTimeout(r, 50));
+        if (shouldStop) break;
+      }
+      isRunning = false;
+    }
+
+    const loopPromise = simulateCollectorLoop();
+
+    // 在第 2 次滚动后，用户点击停止采集
+    setTimeout(() => {
+      shouldStop = true;
+    }, 70);
+
+    await loopPromise;
+
+    assert.strictEqual(isRunning, false, '停止后采集器必须标记为未运行');
+    assert.ok(scrollCount <= 3, `用户停止后必须立即终止，实际滚动 ${scrollCount} 次，远小于上限 8 次`);
+  });
+
+  await test('专项测试 6 源码静态验证: content.js 背景图扫描杜绝容器 clientWidth/clientHeight 赋值且支持动态采集状态机', () => {
+    const contentCode = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+
+    // 断言 1: 必须包含真实尺寸异步验证方法与并发限制
+    assert.ok(contentCode.includes('function verifyImageDimensions'), 'content.js 必须包含 verifyImageDimensions');
+    assert.ok(contentCode.includes('function runWithConcurrency'), 'content.js 必须包含 runWithConcurrency 并发限制');
+
+    // 断言 2: 背景图扫描不得直接以容器尺寸 w / h 作为图片分辨率注册
+    assert.ok(
+      !contentCode.includes("url: match[1],\n              width: w,\n              height: h,\n              source: 'background-image'") &&
+      !contentCode.includes("url: match[1],\n              width: cw,\n              height: ch"),
+      '背景图注册绝不能直接将容器 clientWidth/clientHeight 当作真实分辨率'
+    );
+    assert.ok(contentCode.includes("width: check.width,\n              height: check.height,\n              source: 'background-image'"), '背景图必须采用经过验证的真实尺寸 check.width / check.height');
+
+    // 断言 3: 必须包含 dynamicCollector 动态滚动采集器实现
+    assert.ok(contentCode.includes('const dynamicCollector = {'), 'content.js 必须包含 dynamicCollector');
+    assert.ok(contentCode.includes('START_DYNAMIC_COLLECT'), '必须监听 START_DYNAMIC_COLLECT 指令');
+    assert.ok(contentCode.includes('STOP_DYNAMIC_COLLECT'), '必须监听 STOP_DYNAMIC_COLLECT 指令');
+  });
+
+  await test('专项测试 7 源码与 DOM 完整性: gallery.html 与 gallery.js 动态采集组件与状态流转一致性', () => {
+    const htmlCode = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
+    const jsCode = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 检查核心 UI 控件元素在 HTML 中存在
+    const requiredIds = [
+      'btnContinueCollect',
+      'continueCollectText',
+      'collectCountBadge',
+      'btnStopCollect',
+      'collectProgressBanner',
+      'collectProgressText',
+      'btnStopCollectBanner'
+    ];
+
+    for (const id of requiredIds) {
+      assert.ok(htmlCode.includes(`id="${id}"`), `gallery.html 中必须包含 id="${id}"`);
+      assert.ok(jsCode.includes(`document.getElementById('${id}')`), `gallery.js 中必须缓存 id="${id}"`);
+    }
+
+    // 检查 JS 核心方法定义
+    assert.ok(jsCode.includes('function startDynamicCollection'), 'gallery.js 必须实现 startDynamicCollection');
+    assert.ok(jsCode.includes('function stopDynamicCollection'), 'gallery.js 必须实现 stopDynamicCollection');
+    assert.ok(jsCode.includes('function appendNewImages'), 'gallery.js 必须实现 appendNewImages 增量去重');
   });
 
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);

@@ -219,9 +219,86 @@
   }
 
   /**
-   * 页面图片采集主入口
+   * 异步验证图片真实分辨率，带超时控制与错误捕获
    */
-  function collectImagesFromPage() {
+  function verifyImageDimensions(url, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+      if (!url) return resolve({ width: 0, height: 0, valid: false });
+      // 快速剔除无效或 1x1 base64 占位图
+      if (url.startsWith('data:')) {
+        if (url.includes('R0lGODlhAQABA') || url.includes('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB') || url.length < 200) {
+          return resolve({ width: 0, height: 0, valid: false });
+        }
+      }
+
+      // 如果运行在 Node.js 环境或缺失 Image 构造器
+      if (typeof Image === 'undefined') {
+        return resolve({ width: 0, height: 0, valid: true });
+      }
+
+      const img = new Image();
+      let timer = null;
+      let settled = false;
+
+      const finish = (w, h, valid, timeout = false) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        img.onload = null;
+        img.onerror = null;
+        try { img.src = ''; } catch {}
+        resolve({ width: w, height: h, valid, timeout });
+      };
+
+      timer = setTimeout(() => {
+        finish(0, 0, false, true);
+      }, timeoutMs);
+
+      img.onload = () => {
+        const nw = img.naturalWidth || 0;
+        const nh = img.naturalHeight || 0;
+        finish(nw, nh, true, false);
+      };
+
+      img.onerror = () => {
+        finish(0, 0, false, false);
+      };
+
+      try {
+        img.src = url;
+      } catch {
+        finish(0, 0, false, false);
+      }
+    });
+  }
+
+  /**
+   * 并发限制执行池 (限制最大并发数，避免拖慢页面)
+   */
+  async function runWithConcurrency(items, limit, workerFn) {
+    const results = [];
+    let idx = 0;
+    const executing = [];
+
+    for (const item of items) {
+      const p = Promise.resolve().then(() => workerFn(item, idx++)).then(res => {
+        const pIdx = executing.indexOf(p);
+        if (pIdx !== -1) executing.splice(pIdx, 1);
+        return res;
+      });
+      executing.push(p);
+      results.push(p);
+      if (executing.length >= limit) {
+        await Promise.race(executing);
+      }
+    }
+    return Promise.all(results);
+  }
+
+  /**
+   * 页面图片采集主入口 (异步扫描并验证背景图真实尺寸)
+   */
+  async function collectImagesFromPage() {
     // 跨节点的去重逻辑：安全基准，仅当【完整 URL 字符串完全相同】时执行去重
     const candidateMap = new Map(); // targetUrl -> ImageCandidate
 
@@ -229,7 +306,7 @@
       const absUrl = normalizeUrl(url);
       if (!absUrl) return;
 
-      // 提升门槛：小于 150px 排除
+      // 提升门槛：若已知分辨率均小于 150px，剔除
       if (isPixelOrTinyDataUrl(absUrl, width, height)) {
         return;
       }
@@ -280,21 +357,19 @@
         return;
       }
 
-      // 1.3 尺寸检测：过滤 < 150px 杂质
+      // 1.3 尺寸检测：过滤真实分辨率 < 150px 杂质或微型图标容器
       const naturalWidth = img.naturalWidth || 0;
       const naturalHeight = img.naturalHeight || 0;
       const clientWidth = img.clientWidth || img.offsetWidth || 0;
       const clientHeight = img.clientHeight || img.offsetHeight || 0;
 
-      // 如果已具备渲染尺寸且尺寸均 < 150px，剔除
+      // 如果已具备真实渲染分辨率且尺寸均 < 150px，剔除
       if (naturalWidth > 0 && naturalHeight > 0) {
         if (naturalWidth < 150 || naturalHeight < 150) return;
       } else if (clientWidth > 0 && clientHeight > 0) {
-        if (clientWidth < 150 || clientHeight < 150) return;
+        // 容器小于 50px 显然是图标、按钮等杂质
+        if (clientWidth < 50 || clientHeight < 50) return;
       }
-
-      let width = naturalWidth || clientWidth;
-      let height = naturalHeight || clientHeight;
 
       // 1.4 顺藤摸瓜探测：识别外层包裹的 <a> 链接与本地大图属性
       const { directImageUrl, detailUrl } = extractAnchorInfo(img);
@@ -305,8 +380,8 @@
       const bestSrcset = extractBestFromSrcset(rawSrcset);
 
       let chosenUrl = null;
-      let chosenWidth = width;
-      let chosenHeight = height;
+      let chosenWidth = 0;
+      let chosenHeight = 0;
       let chosenSource = 'img';
 
       // 决选最高优先级 A：父级 <a> 直接指向的高清大图直链
@@ -319,13 +394,9 @@
         chosenUrl = localHighRes;
         chosenSource = 'img-local-hd';
       }
-      // 决选优先级 C：srcset 中 descriptor 最大的高清条目
+      // 决选优先级 C：srcset 中 descriptor 最大的高清条目 (注意：srcset 描述符不能直接当作已验证真实尺寸)
       else if (bestSrcset && bestSrcset.url) {
         chosenUrl = bestSrcset.url;
-        chosenWidth = Math.max(width, bestSrcset.width || 0);
-        if (chosenWidth > width && width > 0 && height > 0) {
-          chosenHeight = Math.round(chosenWidth * (height / width));
-        }
         chosenSource = 'img-srcset-hd';
       }
 
@@ -347,6 +418,15 @@
         if (primaryUrl) {
           chosenUrl = primaryUrl;
           chosenSource = 'img';
+        }
+      }
+
+      // 严格尺寸确认：只有当 chosenUrl 确实是当前 img 已经在 DOM 中加载且具有 naturalWidth/naturalHeight 时，才是真实已验证分辨率
+      // 绝不把容器 clientWidth/clientHeight 或 srcset 描述符当成已验证尺寸！未验证时设为 0（画廊显示「未知尺寸」，不编造）
+      if (chosenUrl && primaryUrl && (chosenUrl === primaryUrl || chosenUrl === img.src)) {
+        if (naturalWidth > 0 && naturalHeight > 0) {
+          chosenWidth = naturalWidth;
+          chosenHeight = naturalHeight;
         }
       }
 
@@ -381,7 +461,7 @@
       if (bestSrcset && bestSrcset.url) {
         registerCandidate({
           url: bestSrcset.url,
-          width: bestSrcset.width || 0,
+          width: 0, // 绝不把 srcset 描述符当成已验证尺寸
           height: 0,
           source: 'picture-source-hd'
         });
@@ -396,8 +476,8 @@
 
       const poster = video.getAttribute('poster');
       if (poster) {
-        const w = video.videoWidth || video.clientWidth || 0;
-        const h = video.videoHeight || video.clientHeight || 0;
+        const w = video.videoWidth || 0;
+        const h = video.videoHeight || 0;
         if ((w === 0 || w >= 150) && (h === 0 || h >= 150)) {
           registerCandidate({
             url: poster,
@@ -410,6 +490,9 @@
     });
 
     // 4. 扫描 CSS background-image
+    // 关键修复：绝不再把容器 clientWidth/clientHeight 当作背景图片真实分辨率
+    // 对背景图 URL 执行真实图片宽高验证，剔除过小占位图/追踪像素，同时保留真正的大图背景
+    const candidateBgUrls = new Set();
     const bgElements = document.querySelectorAll(
       '[style*="background"], header, banner, hero, .banner, .hero, .bg, .slider, .carousel, div, section, article'
     );
@@ -420,10 +503,10 @@
         if (!isElementVisible(el)) return;
         if (isAvatarOrIcon(el)) return;
 
-        const w = el.clientWidth || el.offsetWidth || 0;
-        const h = el.clientHeight || el.offsetHeight || 0;
-        // 背景容器小于 150px 排除
-        if (w > 0 && h > 0 && (w < 150 || h < 150)) {
+        // 容器自身如果小于 50px，通常是小图标或装饰条，提前跳过
+        const cw = el.clientWidth || el.offsetWidth || 0;
+        const ch = el.clientHeight || el.offsetHeight || 0;
+        if (cw > 0 && ch > 0 && (cw < 50 || ch < 50)) {
           return;
         }
 
@@ -440,18 +523,61 @@
         if (bgStyle && bgStyle !== 'none') {
           const match = bgStyle.match(urlPattern);
           if (match && match[1]) {
-            registerCandidate({
-              url: match[1],
-              width: w,
-              height: h,
-              source: 'background-image'
-            });
+            const rawUrl = match[1].trim();
+            const absUrl = normalizeUrl(rawUrl);
+            if (absUrl && !candidateMap.has(absUrl)) {
+              if (!isPixelOrTinyDataUrl(absUrl, 0, 0)) {
+                candidateBgUrls.add(absUrl);
+              }
+            }
           }
         }
       } catch {
         // 忽略样式跨域等错误
       }
     });
+
+    // 对收集到的候选背景图片 URL 执行受限并发与超时校验
+    if (candidateBgUrls.size > 0) {
+      const bgUrlList = Array.from(candidateBgUrls);
+      await runWithConcurrency(bgUrlList, 5, async (bgUrl) => {
+        const check = await verifyImageDimensions(bgUrl, 2000);
+        if (check.valid) {
+          if (check.width > 0 && check.height > 0) {
+            // 真实尺寸过小的占位图、模糊缩略图、图标 (< 150px) 过滤剔除
+            if (check.width < 150 || check.height < 150) {
+              return;
+            }
+            // 真正的大幅背景图保留，并记录真实分辨率
+            registerCandidate({
+              url: bgUrl,
+              width: check.width,
+              height: check.height,
+              source: 'background-image'
+            });
+          } else {
+            // 尺寸无法确定时（如 SVG），显示「未知尺寸」，不编造宽高
+            registerCandidate({
+              url: bgUrl,
+              width: 0,
+              height: 0,
+              source: 'background-image'
+            });
+          }
+        } else if (check.timeout) {
+          // 验证超时但为有效网络图片：保留但设为未知尺寸，不编造
+          if (bgUrl.startsWith('http://') || bgUrl.startsWith('https://')) {
+            registerCandidate({
+              url: bgUrl,
+              width: 0,
+              height: 0,
+              source: 'background-image'
+            });
+          }
+        }
+        // 若 check.valid 为 false 且非超时，则是 404/无效图片，直接剔除
+      });
+    }
 
     // 输出清洗后的图片列表（包含原始地址与降级元数据）
     const finalResults = Array.from(candidateMap.values()).map(item => ({
@@ -473,27 +599,189 @@
     return finalResults;
   }
 
-  // 监听来自 Background 的采集指令
-  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request && request.action === 'SNIFF_IMAGES') {
-      try {
-        const images = collectImagesFromPage();
-        sendResponse({
-          success: true,
-          images: images,
-          pageUrl: window.location.href,
-          pageTitle: document.title || 'Untitled Page'
-        });
-      } catch (err) {
-        sendResponse({
-          success: false,
-          error: err.message
+  /**
+   * 动态滚动采集器：支持在原网页持续滚动、增量发现并去重
+   * 严格受控：设置合理的滚动次数上限 (默认 8，最大 15)、图片数量上限 (100) 与时间上限 (30s)
+   */
+  const dynamicCollector = {
+    isRunning: false,
+    shouldStop: false,
+    seenUrls: new Set(),
+
+    async start(options = {}, onProgress) {
+      if (this.isRunning) {
+        return { success: false, error: '动态采集正在进行中' };
+      }
+      this.isRunning = true;
+      this.shouldStop = false;
+
+      const maxScrolls = Math.min(Math.max(options.maxScrolls || 8, 1), 15);
+      const maxImages = Math.min(Math.max(options.maxImages || 100, 10), 200);
+      const intervalMs = Math.min(Math.max(options.intervalMs || 1200, 600), 3000);
+      const maxTimeMs = 30000; // 30秒硬上限防失控
+      const startTime = Date.now();
+
+      // 初始化已见过的 URL (由画廊传入当前已有的全部图片地址，防止重复加入)
+      if (Array.isArray(options.existingUrls)) {
+        options.existingUrls.forEach(u => {
+          if (u) this.seenUrls.add(u);
         });
       }
+
+      let totalNewFound = 0;
+      let lastScrollY = -1;
+      let bottomHitCount = 0;
+
+      // 阶段 1：先对当前已渲染 DOM 做一次即时采集（捕获用户手动滚动后已加载的内容）
+      const initialImages = await collectImagesFromPage();
+      const initialNew = [];
+      for (const img of initialImages) {
+        if (!this.seenUrls.has(img.url)) {
+          this.seenUrls.add(img.url);
+          initialNew.push(img);
+        }
+      }
+      if (initialNew.length > 0) {
+        totalNewFound += initialNew.length;
+        if (typeof onProgress === 'function') {
+          onProgress({
+            scrollIndex: 0,
+            maxScrolls,
+            newImages: initialNew,
+            totalNew: totalNewFound,
+            isDone: false
+          });
+        }
+      }
+
+      // 阶段 2：动态滚动循环
+      for (let scrollIdx = 1; scrollIdx <= maxScrolls; scrollIdx++) {
+        if (this.shouldStop) break;
+        if (Date.now() - startTime >= maxTimeMs) break;
+        if (totalNewFound >= maxImages) break;
+
+        // 向下平滑滚动约 85% 视口高度
+        const scrollStep = Math.max(Math.floor(window.innerHeight * 0.85), 600);
+        window.scrollBy({ top: scrollStep, behavior: 'smooth' });
+
+        // 响应式等待：支持在等待期间及时响应停止指令
+        const waitSlice = 100;
+        let waited = 0;
+        while (waited < intervalMs && !this.shouldStop) {
+          await new Promise(r => setTimeout(r, waitSlice));
+          waited += waitSlice;
+        }
+
+        if (this.shouldStop) break;
+
+        // 触底检测：若连续 2 次滚动高度无变化，说明到达页面底部
+        const currentScrollY = window.scrollY || window.pageYOffset || (document.documentElement && document.documentElement.scrollTop) || 0;
+        const maxScrollable = ((document.documentElement && document.documentElement.scrollHeight) || document.body.scrollHeight) - window.innerHeight;
+        if (currentScrollY >= maxScrollable - 30 || currentScrollY === lastScrollY) {
+          bottomHitCount++;
+          if (bottomHitCount >= 2) break;
+        } else {
+          bottomHitCount = 0;
+        }
+        lastScrollY = currentScrollY;
+
+        // 嗅探新加载的 DOM 图片
+        const currentImages = await collectImagesFromPage();
+        const batchNew = [];
+        for (const img of currentImages) {
+          if (!this.seenUrls.has(img.url)) {
+            this.seenUrls.add(img.url);
+            batchNew.push(img);
+          }
+        }
+
+        if (batchNew.length > 0) {
+          totalNewFound += batchNew.length;
+        }
+
+        if (typeof onProgress === 'function') {
+          onProgress({
+            scrollIndex: scrollIdx,
+            maxScrolls,
+            newImages: batchNew,
+            totalNew: totalNewFound,
+            isDone: scrollIdx === maxScrolls || totalNewFound >= maxImages
+          });
+        }
+      }
+
+      const stoppedByUser = this.shouldStop;
+      this.isRunning = false;
+      this.shouldStop = false;
+
+      return {
+        success: true,
+        totalNew: totalNewFound,
+        stoppedByUser
+      };
+    },
+
+    stop() {
+      if (this.isRunning) {
+        this.shouldStop = true;
+      }
     }
-    return true;
+  };
+
+  // 监听来自 Background 与 Gallery 的采集指令
+  chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (!request || !request.action) return false;
+
+    if (request.action === 'SNIFF_IMAGES') {
+      (async () => {
+        try {
+          const images = await collectImagesFromPage();
+          sendResponse({
+            success: true,
+            images: images,
+            pageUrl: window.location.href,
+            pageTitle: document.title || 'Untitled Page'
+          });
+        } catch (err) {
+          sendResponse({
+            success: false,
+            error: err.message
+          });
+        }
+      })();
+      return true; // 保持异步消息通道有效
+    }
+
+    if (request.action === 'START_DYNAMIC_COLLECT') {
+      (async () => {
+        try {
+          const result = await dynamicCollector.start(request.options || {}, (progress) => {
+            chrome.runtime.sendMessage({
+              action: 'DYNAMIC_COLLECT_PROGRESS',
+              ...progress
+            }).catch(() => {});
+          });
+          sendResponse(result);
+        } catch (err) {
+          sendResponse({
+            success: false,
+            error: err.message
+          });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === 'STOP_DYNAMIC_COLLECT') {
+      dynamicCollector.stop();
+      sendResponse({ success: true, message: '已停止动态采集' });
+      return true;
+    }
+
+    return false;
   });
 
-  // 全局暴露嗅探方法供 executeScript 直接获取结果
+  // 全局暴露嗅探与动态采集方法供 executeScript 直接调度
   window.__webImageCollectorSniff = collectImagesFromPage;
+  window.__webImageCollectorDynamic = dynamicCollector;
 })();

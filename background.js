@@ -49,11 +49,12 @@ chrome.action.onClicked.addListener(async (tab) => {
         // 如果消息通道仍未就绪，使用 executeScript 执行函数返回值
         const injectedResults = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: () => {
+          func: async () => {
             if (typeof window.__webImageCollectorSniff === 'function') {
+              const sniffedImages = await window.__webImageCollectorSniff();
               return {
                 success: true,
-                images: window.__webImageCollectorSniff(),
+                images: sniffedImages,
                 pageUrl: window.location.href,
                 pageTitle: document.title || 'Untitled Page'
               };
@@ -73,9 +74,10 @@ chrome.action.onClicked.addListener(async (tab) => {
 
     console.log(`[Web Image Collector] 成功捕获到 ${images.length} 张图片，正在打开画廊工作台...`);
 
-    // 3. 将抓取到的数据写入 storage.local
+    // 3. 将抓取到的数据写入 storage.local (记录来源标签页 ID 便于继续采集)
     await chrome.storage.local.set({
       currentCollectorTask: {
+        sourceTabId: tab.id,
         images: images,
         pageUrl: pageUrl,
         pageTitle: pageTitle,
