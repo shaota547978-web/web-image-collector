@@ -38,6 +38,9 @@
   const MAX_DEEP_CONCURRENCY = 2; // 穿透详情页严格限制为 2 并发，防止请求过频触发风控
   const QUOTA_LIMIT_BYTES = 150 * 1024 * 1024; // 150MB 下载数据量保护阈值
 
+  // 统一功能开关：深度穿透当前处于暂停关闭状态，MVP 阶段专注于核心下载链路稳定可靠
+  const DEEP_GRAB_ENABLED = false;
+
   // -------------------------------------------------------------
   // 2. DOM 元素缓存
   // -------------------------------------------------------------
@@ -486,6 +489,11 @@
   // -------------------------------------------------------------
   function updateDeepGrabButtonBadge() {
     if (!dom.btnDeepGrab) return;
+    if (!DEEP_GRAB_ENABLED) {
+      dom.btnDeepGrab.classList.add('hidden');
+      dom.btnDeepGrab.style.display = 'none';
+      return;
+    }
     const pendingCount = state.allImages.filter(img => img.hasDetailLink && img.detailUrl && img.deepGrabStatus !== 'success').length;
     if (pendingCount > 0) {
       dom.btnDeepGrab.classList.remove('hidden');
@@ -504,6 +512,7 @@
   }
 
   function renderDeepGrabBadge(img) {
+    if (!DEEP_GRAB_ENABLED) return '';
     if (!img.hasDetailLink && !img.detailUrl) return '';
 
     if (img.deepGrabStatus === 'success') {
@@ -521,6 +530,7 @@
   }
 
   function updateCardDeepGrabUI(item, cardEl) {
+    if (!DEEP_GRAB_ENABLED) return;
     const card = cardEl || dom.galleryGrid.querySelector(`.image-card[data-id="${CSS.escape(item.id)}"]`);
     if (!card) return;
 
@@ -736,8 +746,13 @@
 
   /**
    * 启动受控并发穿透流程 (并发限制 2，微延迟 200ms)
+   * 注：当前功能范围收口中已统一暂停，完整算法保留在此供后续阶段评估
    */
   async function startDeepGrab() {
+    if (!DEEP_GRAB_ENABLED) {
+      console.warn('[DeepGrab] 深度穿透功能当前处于暂停关闭状态');
+      return;
+    }
     if (state.isDeepGrabbing) return;
 
     const candidates = state.allImages.filter(img => img.hasDetailLink && img.detailUrl && img.deepGrabStatus !== 'success');
