@@ -25,8 +25,10 @@
 
     // 下载运行时状态
     isDownloading: false,
+    isCompressing: false,         // 是否正在进行 JSZip 压缩打包 (此阶段禁用取消)
     cancelRequested: false,       // 用户主动点击“取消下载”标记
     stopAndZipRequested: false,   // 触发150MB保护后用户选择“停止后续下载，仅打包已完成图片”标记
+    abortController: null,        // 用于及时中止正在进行的网络请求
     downloadMap: new Map(),       // id -> { status: 'idle'|'pending'|'downloading'|'success'|'failed', error?: string, blob?: Blob, size?: number, filename?: string }
     totalDownloadedBytes: 0,
     quotaWarned: false,           // 是否已触发过 150MB 保护警告
@@ -112,6 +114,7 @@
     currentDownloadedSizeText: document.getElementById('currentDownloadedSizeText'),
     btnQuotaStopAndZip: document.getElementById('btnQuotaStopAndZip'),
     btnQuotaContinue: document.getElementById('btnQuotaContinue'),
+    btnQuotaCancelAll: document.getElementById('btnQuotaCancelAll'),
 
     modalLightbox: document.getElementById('modalLightbox'),
     btnCloseLightbox: document.getElementById('btnCloseLightbox'),
@@ -1145,13 +1148,19 @@
     }
 
     state.isDownloading = true;
+    state.isCompressing = false;
     state.cancelRequested = false;
     state.stopAndZipRequested = false;
     state.totalDownloadedBytes = 0;
     state.quotaWarned = false;
+    state.abortController = new AbortController();
     state.downloadMap.clear();
 
     dom.btnDownloadZip.disabled = true;
+    if (dom.btnCancelDownload) {
+      dom.btnCancelDownload.disabled = false;
+      dom.btnCancelDownload.title = '取消当前下载';
+    }
     dom.bottomConsole.classList.remove('hidden');
     dom.errorSummaryBar.classList.add('hidden');
     dom.errorDetailsList.innerHTML = '';
@@ -1199,9 +1208,12 @@
             `已下载数据: ${formatBytes(state.totalDownloadedBytes)}`
           );
 
-          // 执行下载（含高清->原图自动回退与真实图片格式校验）
+          // 执行下载（含高清->原图自动回退与真实图片格式校验，传入 signal 支持及时中止）
           const imgItem = state.allImages.find(img => img.id === id) || { id, url: '' };
-          const fetchResult = await fetchImageWithFallback(imgItem);
+          const fetchResult = await fetchImageWithFallback(imgItem, state.abortController ? state.abortController.signal : null);
+
+          // 若在下载过程中用户点击了取消，立即退出
+          if (state.cancelRequested) break;
 
           if (fetchResult.success) {
             const blob = fetchResult.blob;
@@ -1255,7 +1267,7 @@
       // 操作 C：用户主动点击“取消下载”
       if (state.cancelRequested) {
         dom.consolePhaseText.textContent = '下载任务已由用户主动取消';
-        dom.consoleDetailText.textContent = '已中止全部操作，未生成任何压缩包';
+        dom.consoleDetailText.textContent = '已中止全部网络请求，未生成任何压缩包';
         dom.progressBarFill.style.width = '0%';
         finishDownloadSession();
         return;
@@ -1268,12 +1280,12 @@
           if (!item || item.status === 'pending') {
             state.downloadMap.set(id, {
               status: 'failed',
-              error: '已达 150MB 数据保护上限，已停止下载后续图片'
+              error: '已达 150MB 数据保护阈值，已停止下载后续图片'
             });
             updateCardStatusUI(id, 'failed', 0, '保护阈值跳过');
             const imgItem = state.allImages.find(img => img.id === id);
             const reportUrl = imgItem ? (imgItem.originalUrl || imgItem.url) : id;
-            failedList.push({ id, url: reportUrl, error: '已达 150MB 数据保护上限，已停止下载后续图片' });
+            failedList.push({ id, url: reportUrl, error: '已达 150MB 数据保护阈值，已停止下载后续图片' });
           }
         });
       }
@@ -1300,7 +1312,7 @@
         return;
       }
 
-      // 区分三种操作的状态反馈
+      // 区分操作的状态反馈
       if (state.stopAndZipRequested) {
         // 操作 B：达到限制后选择“停止并打包”
         dom.consolePhaseText.textContent = `保护限制停止：正在打包已完成的 ${successfulItems.length} 张图片 (未完成 ${uncompletedCount} 张)...`;
@@ -1316,7 +1328,21 @@
         showFailedDrawer(failedList);
       }
 
-      // 阶段 2：执行本地 JSZip 打包
+      // 检查在进入压缩前是否被用户取消
+      if (state.cancelRequested) {
+        dom.consolePhaseText.textContent = '下载任务已由用户主动取消';
+        dom.consoleDetailText.textContent = '已中止全部操作，未生成任何压缩包';
+        finishDownloadSession();
+        return;
+      }
+
+      // 阶段 2：执行本地 JSZip 打包（此阶段不可打断，明确禁用取消按钮并提示）
+      state.isCompressing = true;
+      if (dom.btnCancelDownload) {
+        dom.btnCancelDownload.disabled = true;
+        dom.btnCancelDownload.title = '压缩打包中无法取消';
+      }
+
       const zip = new JSZip();
       successfulItems.forEach(item => {
         zip.file(item.filename, item.blob);
@@ -1333,11 +1359,12 @@
         dom.consoleDetailText.textContent = `ZIP 压缩中: ${metadata.percent.toFixed(0)}%`;
       });
 
-      // 阶段 3：调起原生保存
+      // 阶段 3：调起原生保存（准确区分生成成功与实际落盘状态，杜绝提前宣称已保存）
       dom.progressBarFill.style.width = '100%';
       dom.consolePhaseText.textContent = state.stopAndZipRequested
-        ? `打包完成！已保存 ${successfulItems.length} 张已完成图片 (未完成 ${uncompletedCount} 张)`
-        : `打包完成！已保存全部 ${successfulItems.length} 张图片`;
+        ? `ZIP 生成成功，正在请求保存 (已完成 ${successfulItems.length} 张，未完成 ${uncompletedCount} 张)...`
+        : `ZIP 生成成功，正在请求保存 (共 ${successfulItems.length} 张)...`;
+      dom.consoleDetailText.textContent = '请在弹出的保存窗口中确认保存位置';
       triggerSaveZip(zipBlob);
 
     } catch (err) {
@@ -1351,18 +1378,27 @@
 
   function finishDownloadSession() {
     state.isDownloading = false;
-    dom.btnDownloadZip.disabled = false;
+    state.isCompressing = false;
+    state.abortController = null;
+    if (dom.btnDownloadZip) dom.btnDownloadZip.disabled = false;
+    if (dom.btnCancelDownload) {
+      dom.btnCancelDownload.disabled = false;
+      dom.btnCancelDownload.title = '取消当前下载';
+    }
     state.quotaPauseResolver = null;
   }
 
-  // 单个 URL 请求与格式验证（Fix 3：防止伪装为图片的 HTML 错误页/JSON 错误响应）
-  async function fetchSingleUrlAndValidate(url) {
+  // 单个 URL 请求与格式验证（Fix 3：防止伪装为图片的 HTML 错误页/JSON 错误响应，支持 signal 及时取消）
+  async function fetchSingleUrlAndValidate(url, signal = null) {
     if (!url) return { success: false, error: '无效的图片地址' };
+    if (signal && signal.aborted) {
+      return { success: false, error: '下载任务已取消', aborted: true };
+    }
 
     // 1. 如果是 data URL
     if (url.startsWith('data:')) {
       try {
-        const res = await fetch(url);
+        const res = await fetch(url, { signal });
         const blob = await res.blob();
         if (!blob || blob.size === 0) {
           return { success: false, error: 'Data URL 内容为空' };
@@ -1373,6 +1409,9 @@
         }
         return { success: true, blob, ext: validation.ext, mime: validation.mime };
       } catch (err) {
+        if ((signal && signal.aborted) || err.name === 'AbortError') {
+          return { success: false, error: '下载任务已取消', aborted: true };
+        }
         return { success: false, error: 'Data URL 解析失败: ' + err.message };
       }
     }
@@ -1382,7 +1421,8 @@
       const response = await fetch(url, {
         method: 'GET',
         mode: 'cors',
-        credentials: 'omit'
+        credentials: 'omit',
+        signal: signal
       });
 
       if (!response.ok) {
@@ -1414,9 +1454,16 @@
       };
 
     } catch (fetchErr) {
+      if ((signal && signal.aborted) || fetchErr.name === 'AbortError') {
+        return { success: false, error: '下载任务已取消', aborted: true };
+      }
+
       // 3. 降级尝试：利用 Image 标签 + Canvas 转 Blob（应对部分允许绘制但不响应 fetch 的场景）
       try {
         const canvasBlob = await fetchViaCanvasFallback(url);
+        if (signal && signal.aborted) {
+          return { success: false, error: '下载任务已取消', aborted: true };
+        }
         const validation = await detectAndValidateImageFormat(canvasBlob);
         if (!validation.isValid) {
           throw new Error('Canvas 导出的数据格式校验失败');
@@ -1428,6 +1475,9 @@
           mime: validation.mime || 'image/png'
         };
       } catch {
+        if (signal && signal.aborted) {
+          return { success: false, error: '下载任务已取消', aborted: true };
+        }
         return {
           success: false,
           error: fetchErr.message || '跨域限制 (CORS) 或服务端防盗链拦截'
@@ -1436,8 +1486,11 @@
     }
   }
 
-  // 图片多级下载与回退调度器（Fix 2 高清下载失败自动回退原始地址）
-  async function fetchImageWithFallback(itemOrUrl) {
+  // 图片多级下载与回退调度器（Fix 2 高清下载失败自动回退原始地址，支持 signal 及时取消）
+  async function fetchImageWithFallback(itemOrUrl, signal = null) {
+    if (signal && signal.aborted) {
+      return { success: false, error: '下载任务已取消', aborted: true };
+    }
     let primaryUrl = '';
     let originalUrl = null;
     let fallbackUrl = null;
@@ -1467,10 +1520,16 @@
     let lastError = null;
 
     for (let i = 0; i < candidates.length; i++) {
+      if (signal && signal.aborted) {
+        return { success: false, error: '下载任务已取消', aborted: true };
+      }
       const candidateUrl = candidates[i];
       const isFallback = (i > 0);
 
-      const result = await fetchSingleUrlAndValidate(candidateUrl);
+      const result = await fetchSingleUrlAndValidate(candidateUrl, signal);
+      if (result.aborted) {
+        return result;
+      }
       if (result.success) {
         if (isFallback) {
           console.info(`[Gallery] 原始地址回退成功: ${candidateUrl}`);
@@ -1557,6 +1616,7 @@
   }
 
   // 150MB 数据保护阈值暂停
+  // 150MB 数据保护阈值暂停
   function pauseForQuotaGuard() {
     let resolver;
     const promise = new Promise(resolve => {
@@ -1582,7 +1642,21 @@
     }
   }
 
-  // 触发保存 ZIP 文件
+  // 用户在保护弹窗中选择彻底取消下载任务
+  function cancelQuotaGuard() {
+    dom.modalQuotaGuard.classList.add('hidden');
+    state.cancelRequested = true;
+    if (state.abortController) {
+      state.abortController.abort();
+    }
+    if (state.quotaPauseResolver) {
+      state.quotaPauseResolver.resolve();
+      state.quotaPauseResolver = null;
+    }
+    dom.consolePhaseText.textContent = '正在取消下载任务...';
+  }
+
+  // 触发保存 ZIP 文件（准确追踪：生成成功 -> 保存已发起 -> 浏览器实际落盘/失败）
   function triggerSaveZip(blob) {
     const filename = `images_bundle_${Date.now()}.zip`;
     const objectUrl = URL.createObjectURL(blob);
@@ -1593,19 +1667,60 @@
         filename: filename,
         saveAs: true
       }, (downloadId) => {
-        if (chrome.runtime.lastError) {
+        if (chrome.runtime.lastError || !downloadId) {
+          const errMsg = chrome.runtime.lastError ? chrome.runtime.lastError.message : '下载拉起失败';
+          console.warn('[Gallery] chrome.downloads.download 异常，降级为模拟点击下载:', errMsg);
           fallbackAnchorDownload(objectUrl, filename);
+          dom.consolePhaseText.textContent = '保存已发起：请在浏览器下载面板中查看进度';
+          dom.consoleDetailText.textContent = `文件: ${filename} (${formatBytes(blob.size)})`;
+          setTimeout(() => { URL.revokeObjectURL(objectUrl); }, 60000);
+          return;
+        }
+
+        // 保存已发起，等待浏览器完成写入
+        dom.consolePhaseText.textContent = '保存已发起，等待浏览器完成写入...';
+        dom.consoleDetailText.textContent = `文件: ${filename} (若弹出保存窗口，请点击保存)`;
+
+        // 监听下载状态变化，准确区分完成与失败
+        if (chrome.downloads.onChanged && typeof chrome.downloads.onChanged.addListener === 'function') {
+          const downloadListener = (delta) => {
+            if (delta.id !== downloadId) return;
+
+            if (delta.state && delta.state.current === 'complete') {
+              chrome.downloads.onChanged.removeListener(downloadListener);
+              dom.consolePhaseText.textContent = state.stopAndZipRequested
+                ? '保存完成！已成功保存已完成图片的压缩包'
+                : '保存完成！ZIP 压缩包已成功保存到本地磁盘';
+              dom.consoleDetailText.textContent = `文件已落盘: ${filename} (${formatBytes(blob.size)})`;
+              URL.revokeObjectURL(objectUrl);
+            } else if (delta.state && delta.state.current === 'interrupted') {
+              chrome.downloads.onChanged.removeListener(downloadListener);
+              const reason = delta.error ? delta.error.current : '未知错误';
+              if (reason === 'USER_CANCELED') {
+                dom.consolePhaseText.textContent = '保存已取消：用户取消了文件保存窗口';
+                dom.consoleDetailText.textContent = 'ZIP 压缩文件未写入磁盘';
+              } else {
+                dom.consolePhaseText.textContent = `保存失败：浏览器写入错误 (${reason})`;
+                dom.consoleDetailText.textContent = '请检查浏览器下载权限或磁盘空间';
+                showAlert(`ZIP 保存失败: ${reason}`);
+              }
+              URL.revokeObjectURL(objectUrl);
+            }
+          };
+          chrome.downloads.onChanged.addListener(downloadListener);
         } else {
-          console.log('[Gallery] 原生下载任务已创建, ID:', downloadId);
+          // 若无 onChanged 监听权限，保持“保存已发起”状态提示
+          dom.consolePhaseText.textContent = '保存已发起：请在浏览器下载面板中查看进度';
+          dom.consoleDetailText.textContent = `文件: ${filename} (${formatBytes(blob.size)})`;
+          setTimeout(() => { URL.revokeObjectURL(objectUrl); }, 60000);
         }
       });
     } else {
       fallbackAnchorDownload(objectUrl, filename);
+      dom.consolePhaseText.textContent = '保存已发起：请在浏览器下载面板中查看进度';
+      dom.consoleDetailText.textContent = `文件: ${filename} (${formatBytes(blob.size)})`;
+      setTimeout(() => { URL.revokeObjectURL(objectUrl); }, 60000);
     }
-
-    setTimeout(() => {
-      URL.revokeObjectURL(objectUrl);
-    }, 60000);
   }
 
   function fallbackAnchorDownload(url, filename) {
@@ -1673,36 +1788,53 @@
       const item = state.allImages.find(img => img.id === idOrUrl || img.url === idOrUrl);
       const targetUrl = item ? item.url : idOrUrl;
       const fallbackUrl = (item && item.originalUrl && item.originalUrl !== targetUrl) ? item.originalUrl : null;
-      const ext = getUrlExtension(targetUrl);
+
+      // 1. 优先复用下载池已成功的 Blob（避免重复请求且保证扩展名精确）
+      const cached = item ? state.downloadMap.get(item.id) : null;
+      let blob = null;
+      let ext = null;
+
+      if (cached && cached.status === 'success' && cached.blob) {
+        blob = cached.blob;
+        ext = cached.filename ? cached.filename.split('.').pop() : null;
+      } else {
+        // 2. 发起下载并严格验证二进制格式 (自动触发高清地址->原始地址->Canvas回退)
+        showAlert('正在准备下载单张图片...');
+        const fetchResult = await fetchImageWithFallback(item || { id: idOrUrl, url: targetUrl, originalUrl: fallbackUrl });
+        if (!fetchResult.success) {
+          showAlert(`单张图片下载失败: ${fetchResult.error}`);
+          return;
+        }
+        blob = fetchResult.blob;
+        ext = fetchResult.ext;
+        hideAlert();
+      }
+
+      if (!ext) {
+        ext = getUrlExtension(targetUrl);
+      }
+
       const filename = `single_image_${Date.now()}.${ext}`;
+      const objectUrl = URL.createObjectURL(blob);
 
       if (chrome && chrome.downloads && typeof chrome.downloads.download === 'function') {
         chrome.downloads.download({
-          url: targetUrl,
+          url: objectUrl,
           filename: filename,
           saveAs: true
-        }, () => {
-          if (chrome.runtime.lastError) {
-            if (fallbackUrl) {
-              chrome.downloads.download({
-                url: fallbackUrl,
-                filename: filename,
-                saveAs: true
-              }, () => {
-                if (chrome.runtime.lastError) {
-                  fallbackAnchorDownload(fallbackUrl, filename);
-                }
-              });
-            } else {
-              fallbackAnchorDownload(targetUrl, filename);
-            }
+        }, (downloadId) => {
+          if (chrome.runtime.lastError || !downloadId) {
+            fallbackAnchorDownload(objectUrl, filename);
           }
+          setTimeout(() => { URL.revokeObjectURL(objectUrl); }, 60000);
         });
       } else {
-        fallbackAnchorDownload(targetUrl, filename);
+        fallbackAnchorDownload(objectUrl, filename);
+        setTimeout(() => { URL.revokeObjectURL(objectUrl); }, 60000);
       }
-    } catch {
-      fallbackAnchorDownload(idOrUrl, `image_${Date.now()}.jpg`);
+    } catch (err) {
+      console.error('[Gallery] 单张下载异常:', err);
+      showAlert(`单张下载异常: ${err.message}`);
     }
   }
 
@@ -1848,14 +1980,24 @@
       });
     }
 
-    // 取消下载
+    // 取消下载（在进行 ZIP 压缩打包时不可取消）
     dom.btnCancelDownload.addEventListener('click', () => {
+      if (state.isCompressing) {
+        showAlert('当前正在进行 ZIP 压缩打包，无法中止。请等待压缩完成。');
+        return;
+      }
       state.cancelRequested = true;
+      if (state.abortController) {
+        state.abortController.abort();
+      }
       if (state.quotaPauseResolver) {
         state.quotaPauseResolver.resolve();
         state.quotaPauseResolver = null;
       }
-      dom.consolePhaseText.textContent = '正在取消下载...';
+      if (dom.modalQuotaGuard) {
+        dom.modalQuotaGuard.classList.add('hidden');
+      }
+      dom.consolePhaseText.textContent = '正在取消下载任务...';
     });
 
     // 错误抽屉折叠
@@ -1879,6 +2021,9 @@
     // 150MB 数据保护模态框
     dom.btnQuotaStopAndZip.addEventListener('click', () => resumeQuotaGuard(false));
     dom.btnQuotaContinue.addEventListener('click', () => resumeQuotaGuard(true));
+    if (dom.btnQuotaCancelAll) {
+      dom.btnQuotaCancelAll.addEventListener('click', cancelQuotaGuard);
+    }
 
     // Lightbox 大图预览
     dom.btnCloseLightbox.addEventListener('click', closeLightbox);
@@ -1903,13 +2048,10 @@
       }
     });
 
-    // ESC 快捷键关闭弹窗 / 中止深度穿透
+    // ESC 快捷键关闭弹窗 / 中止深度穿透 / 取消保护下载
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        if (state.isDeepGrabbing) {
-          state.deepGrabCancelRequested = true;
-          if (dom.deepGrabPhaseText) dom.deepGrabPhaseText.textContent = '正在中止穿透...';
-        }
+        if (!dom.modalQuotaGuard.classList.contains('hidden')) cancelQuotaGuard();
         if (!dom.modalLightbox.classList.contains('hidden')) closeLightbox();
         if (!dom.modalPro.classList.contains('hidden')) closeProModal();
       }

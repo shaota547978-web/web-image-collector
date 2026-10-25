@@ -526,6 +526,131 @@ async function runTests() {
     assert.strictEqual(missingIds.length, 0, `发现 gallery.js 引用但 gallery.html 中缺失的 DOM ID: ${missingIds.join(', ')}`);
   });
 
+  // -------------------------------------------------------------
+  // 测试 6：第二轮核心下载可靠性验收测试 (任务 A / B / C / D)
+  // -------------------------------------------------------------
+  test('任务 A: ZIP 保存状态区分生成成功、保存发起与真实完成，杜绝提前宣称已保存', () => {
+    const jsCode = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+    
+    // 1. 验证在 triggerSaveZip 调起前，提示是“ZIP 生成成功，正在请求保存”而非“已保存”
+    assert.ok(
+      jsCode.includes('ZIP 生成成功，正在请求保存'),
+      '在 ZIP 生成后调起保存前，严禁宣称已保存全部图片'
+    );
+    assert.strictEqual(
+      /打包完成！已保存全部/.test(jsCode),
+      false,
+      '代码中严禁残留虚假的提前保存成功提示'
+    );
+
+    // 2. 验证注册了 chrome.downloads.onChanged 监听器，跟踪 complete 与 interrupted 状态
+    assert.ok(
+      jsCode.includes('chrome.downloads.onChanged.addListener'),
+      'triggerSaveZip 必须监听 chrome.downloads.onChanged 以捕获真实保存状态'
+    );
+    assert.ok(
+      jsCode.includes("delta.state.current === 'complete'") &&
+      jsCode.includes("delta.state.current === 'interrupted'"),
+      '必须正确区分下载 complete 与 interrupted 状态'
+    );
+
+    // 3. 验证对用户取消保存窗口与错误中断有明确提示
+    assert.ok(
+      jsCode.includes("USER_CANCELED") && jsCode.includes('用户取消了文件保存窗口'),
+      '必须对用户在保存对话框中点击取消提供明确反馈'
+    );
+  });
+
+  test('任务 B: 取消下载机制具备 AbortController 中止、阻断后续启动及阻断 ZIP 生成', () => {
+    const jsCode = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. 验证引入并使用了 AbortController
+    assert.ok(
+      jsCode.includes('new AbortController()') && jsCode.includes('state.abortController.abort()'),
+      '必须在取消时调用 abortController.abort() 中止网络请求'
+    );
+
+    // 2. 验证 fetchSingleUrlAndValidate 和 fetchImageWithFallback 支持 signal 且拦截 AbortError
+    assert.ok(
+      jsCode.includes('signal = null') && jsCode.includes('signal: signal'),
+      '网络请求必须传入 signal'
+    );
+    assert.ok(
+      jsCode.includes("err.name === 'AbortError'") || jsCode.includes("fetchErr.name === 'AbortError'"),
+      '必须妥善处理 AbortError 异常，不抛出未处理错误'
+    );
+
+    // 3. 验证取消后阻断进入 JSZip 生成
+    assert.ok(
+      jsCode.includes('if (state.cancelRequested) {\n        dom.consolePhaseText.textContent = \'下载任务已由用户主动取消\';') ||
+      jsCode.includes('if (state.cancelRequested) {\r\n        dom.consolePhaseText.textContent = \'下载任务已由用户主动取消\';'),
+      '取消下载时必须直接返回，严禁继续自动生成 ZIP'
+    );
+
+    // 4. 验证 ZIP 压缩中（isCompressing）禁用取消按钮并给出友好提示
+    assert.ok(
+      jsCode.includes('state.isCompressing = true;') &&
+      jsCode.includes('dom.btnCancelDownload.disabled = true;'),
+      'ZIP 压缩阶段必须禁用取消按钮，防止压缩过程中状态混乱'
+    );
+    assert.ok(
+      jsCode.includes('当前正在进行 ZIP 压缩打包，无法中止'),
+      '在压缩阶段点击取消必须给出明确提示'
+    );
+  });
+
+  test('任务 C: 150MB 数据保护阈值明确标注为触发阈值，支持保护弹窗取消任务', () => {
+    const htmlCode = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
+    const jsCode = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. 验证 HTML 提示明确声明 150MB 为保护触发阈值而非绝对内存上限
+    assert.ok(
+      htmlCode.includes('150MB 为保护触发阈值') && htmlCode.includes('非绝对内存上限'),
+      '保护弹窗文案必须明确说明 150MB 为保护触发阈值'
+    );
+
+    // 2. 验证保护弹窗中包含 btnQuotaCancelAll 取消通道
+    assert.ok(
+      htmlCode.includes('id="btnQuotaCancelAll"'),
+      '保护弹窗必须包含取消整个任务的按钮'
+    );
+    assert.ok(
+      jsCode.includes('dom.btnQuotaCancelAll.addEventListener(\'click\', cancelQuotaGuard)'),
+      'btnQuotaCancelAll 必须绑定 cancelQuotaGuard 事件'
+    );
+
+    // 3. 验证 cancelQuotaGuard 妥善解开 quotaPauseResolver 并中止任务
+    assert.ok(
+      jsCode.includes('function cancelQuotaGuard()') &&
+      jsCode.includes('state.cancelRequested = true') &&
+      jsCode.includes('state.quotaPauseResolver.resolve()'),
+      'cancelQuotaGuard 必须释放暂停 Promise，避免页面挂起'
+    );
+  });
+
+  test('任务 D: 单张下载 downloadSingleImage 严格基于真实图片内容确定文件扩展名，杜绝扩展名不符', () => {
+    const jsCode = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+
+    // 1. 验证 downloadSingleImage 会优先复用已验证的 Blob 或通过 fetchImageWithFallback 获取真实内容
+    assert.ok(
+      jsCode.includes('state.downloadMap.get(item.id)') &&
+      jsCode.includes('fetchImageWithFallback'),
+      '单张下载必须复用验证过的 Blob 或通过 fetchImageWithFallback 校验真实格式'
+    );
+
+    // 2. 验证扩展名优先采用 fetchResult.ext，而非仅靠脆弱的 URL 截取
+    assert.ok(
+      jsCode.includes('ext = fetchResult.ext;') || jsCode.includes('ext = cached.filename.split'),
+      '单张下载必须以真实内容校验得到的 ext 命名文件'
+    );
+
+    // 3. 验证单张下载失败时有明确的错误提示
+    assert.ok(
+      jsCode.includes('单张图片下载失败:') || jsCode.includes('单张下载异常:'),
+      '单张下载失败必须给出明确提示'
+    );
+  });
+
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);
   if (passed !== total) {
     process.exit(1);

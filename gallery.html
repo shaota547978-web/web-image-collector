@@ -245,8 +245,9 @@
       <div class="quota-warning-icon">⚠️</div>
       <h2>单包体积保护上限警告</h2>
       <p class="quota-description">
-        当前已下载图片体积已达到 <strong id="currentDownloadedSizeText">150 MB</strong> 数据保护阈值。<br>
-        建议停止后续下载并打包当前已完成的图片，避免单次任务数据过大影响下载稳定性。
+        当前已下载图片体积已达到 <strong id="currentDownloadedSizeText">150 MB</strong> 保护触发阈值。<br>
+        建议停止后续下载并打包当前已完成的图片，避免单次任务数据过大影响下载稳定性。<br>
+        <span style="font-size: 0.85em; opacity: 0.8;">（注：150MB 为保护触发阈值，由于并发下载可能导致总计数据量略有超出，非绝对内存上限）</span>
       </p>
 
       <div class="quota-modal-actions">
@@ -255,6 +256,9 @@
         </button>
         <button id="btnQuotaContinue" class="btn-secondary">
           继续下载剩余图片（单包体积较大）
+        </button>
+        <button id="btnQuotaCancelAll" class="btn-text-only" title="放弃本次下载，不保存任何图片">
+          取消下载任务 (不保存)
         </button>
       </div>
     </div>
