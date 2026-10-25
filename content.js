@@ -194,16 +194,27 @@
     return { directImageUrl: null, detailUrl: absHref };
   }
 
+  // 内存级 URL 尺寸校验缓存：避免同页面或刷新时重复发起网络请求与 Image 构造
+  const verifiedDimensionsCache = new Map(); // url -> { width, height, valid, timeout }
+
   /**
-   * 异步验证图片真实分辨率，带超时控制与错误捕获
+   * 异步验证图片真实分辨率，优先复用已验证缓存，带超时控制与错误捕获
    */
-  function verifyImageDimensions(url, timeoutMs = 2000) {
+  function verifyImageDimensions(url, timeoutMs = 1200) {
     return new Promise((resolve) => {
       if (!url) return resolve({ width: 0, height: 0, valid: false });
+
+      // 1. 命中缓存直接返回，杜绝二次请求
+      if (verifiedDimensionsCache.has(url)) {
+        return resolve(verifiedDimensionsCache.get(url));
+      }
+
       // 快速剔除无效或 1x1 base64 占位图
       if (url.startsWith('data:')) {
         if (url.includes('R0lGODlhAQABA') || url.includes('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB') || url.length < 200) {
-          return resolve({ width: 0, height: 0, valid: false });
+          const res = { width: 0, height: 0, valid: false };
+          verifiedDimensionsCache.set(url, res);
+          return resolve(res);
         }
       }
 
@@ -223,7 +234,11 @@
         img.onload = null;
         img.onerror = null;
         try { img.src = ''; } catch {}
-        resolve({ width: w, height: h, valid, timeout });
+        const result = { width: w, height: h, valid, timeout };
+        if (valid || timeout) {
+          verifiedDimensionsCache.set(url, result);
+        }
+        resolve(result);
       };
 
       timer = setTimeout(() => {
@@ -274,7 +289,8 @@
   /**
    * 页面图片采集主入口 (完整采集所有有效图片，真实校验图片尺寸)
    */
-  async function collectImagesFromPage() {
+  async function collectImagesFromPage(taskId = null) {
+    const t0 = performance.now();
     // 跨节点的去重逻辑：安全基准，仅当【完整 URL 字符串完全相同】时执行去重
     const candidateMap = new Map(); // targetUrl -> ImageCandidate
 
@@ -443,6 +459,9 @@
       }
     });
 
+    // DOM 元素与大图属性探测完成
+    const t1 = performance.now();
+
     // 4. 扫描 CSS background-image
     // 关键修复：绝不再把容器 clientWidth/clientHeight 当作背景图片真实分辨率
     // 对背景图 URL 执行真实图片宽高验证，保留有效小图片（如 32x32）与大幅背景图（如 1920x1080）
@@ -483,53 +502,91 @@
       }
     });
 
-    // 4.1 对收集到的候选背景图片 URL 执行真实尺寸校验（允许小尺寸背景图进入，记录真实尺寸）
-    if (candidateBgUrls.size > 0) {
-      const bgUrlList = Array.from(candidateBgUrls);
-      await runWithConcurrency(bgUrlList, 6, async (bgUrl) => {
-        const check = await verifyImageDimensions(bgUrl, 2000);
-        if (check.valid) {
-          // 记录真实分辨率，不编造父容器尺寸，也不丢弃小尺寸有效背景图
-          registerCandidate({
-            url: bgUrl,
-            width: check.width || 0,
-            height: check.height || 0,
-            source: 'background-image'
-          });
-        } else if (check.timeout) {
-          // 验证超时但为有效网络图片：保留但设为未知尺寸，不编造
-          if (bgUrl.startsWith('http://') || bgUrl.startsWith('https://')) {
-            registerCandidate({
-              url: bgUrl,
-              width: 0,
-              height: 0,
-              source: 'background-image'
-            });
-          }
+    // 背景图片扫描提取完成
+    const t2 = performance.now();
+
+    // 5. 【合并调度真实尺寸校验】（定点优化：避免背景图与普通图片串行排队，去重后统一并发校验）
+    const verificationTasks = [];
+    const scheduledUrls = new Set();
+
+    // 5.1 候选背景图片任务
+    candidateBgUrls.forEach(bgUrl => {
+      if (!scheduledUrls.has(bgUrl)) {
+        scheduledUrls.add(bgUrl);
+        verificationTasks.push({ type: 'bg', url: bgUrl });
+      }
+    });
+
+    // 5.2 未知尺寸候选网络图片（如 srcset 高清候选、未加载懒加载大图）
+    Array.from(candidateMap.values()).forEach(item => {
+      if ((item.width === 0 || item.height === 0) &&
+          item.source !== 'background-image' &&
+          (item.url.startsWith('http://') || item.url.startsWith('https://'))) {
+        if (!scheduledUrls.has(item.url)) {
+          scheduledUrls.add(item.url);
+          verificationTasks.push({ type: 'candidate', item: item, url: item.url });
         }
-      });
-    }
+      }
+    });
 
-    // 5. 对所有未确认尺寸的候选网络图片（如 srcset 高清候选、未加载懒加载大图）进行受控异步验证并更新真实尺寸
-    const unverifiedCandidates = Array.from(candidateMap.values()).filter(
-      item => (item.width === 0 || item.height === 0) &&
-              item.source !== 'background-image' &&
-              (item.url.startsWith('http://') || item.url.startsWith('https://'))
-    );
-
-    if (unverifiedCandidates.length > 0) {
-      await runWithConcurrency(unverifiedCandidates, 8, async (item) => {
+    // 5.3 统一并发执行（安全并发数 10，超时 1200ms，杜绝拖慢原网页）
+    let verifiedCount = 0;
+    if (verificationTasks.length > 0) {
+      await runWithConcurrency(verificationTasks, 10, async (task) => {
         try {
-          const check = await verifyImageDimensions(item.url, 1500);
-          if (check.valid && check.width > 0 && check.height > 0) {
-            item.width = check.width;
-            item.height = check.height;
+          const check = await verifyImageDimensions(task.url, 1200);
+          if (task.type === 'bg') {
+            if (check.valid) {
+              // 记录真实分辨率，不编造父容器尺寸，也不丢弃小尺寸有效背景图
+              registerCandidate({
+                url: task.url,
+                width: check.width || 0,
+                height: check.height || 0,
+                source: 'background-image'
+              });
+            } else if (check.timeout) {
+              // 验证超时但为有效网络图片：保留但设为未知尺寸，不编造
+              if (task.url.startsWith('http://') || task.url.startsWith('https://')) {
+                registerCandidate({
+                  url: task.url,
+                  width: 0,
+                  height: 0,
+                  source: 'background-image'
+                });
+              }
+            }
+          } else if (task.type === 'candidate' && task.item) {
+            if (check.valid && check.width > 0 && check.height > 0) {
+              task.item.width = check.width;
+              task.item.height = check.height;
+            }
           }
         } catch {
           // 校验失败保留原有 0 宽高，由画廊显示「未知尺寸」
+        } finally {
+          verifiedCount++;
+          // 向画廊实时通知真实识别进度（杜绝假进度条）
+          if (taskId && (verifiedCount % 6 === 0 || verifiedCount === verificationTasks.length)) {
+            try {
+              chrome.runtime.sendMessage({
+                action: 'SNIFF_PROGRESS',
+                taskId: taskId,
+                count: candidateMap.size
+              }).catch(() => {});
+            } catch {}
+          }
         }
       });
     }
+
+    const t3 = performance.now();
+
+    // 打印真实耗时分析（定位耗时环节）
+    console.log(`[Web Image Collector Perf] 任务 ${taskId || 'default'} 耗时分析:
+- 1. DOM 图片提取: ${(t1 - t0).toFixed(1)}ms
+- 2. CSS 背景图片发现: ${(t2 - t1).toFixed(1)}ms
+- 3. 真实尺寸合并校验: ${(t3 - t2).toFixed(1)}ms (任务总数: ${verificationTasks.length})
+- 扫描总耗时: ${(t3 - t0).toFixed(1)}ms, 累计候选: ${candidateMap.size}`);
 
     // 6. 输出清洗后的图片列表（包含原始地址与降级元数据，不过滤小图片）
     const finalResults = Array.from(candidateMap.values()).map(item => ({
@@ -558,7 +615,7 @@
     if (request.action === 'SNIFF_IMAGES') {
       (async () => {
         try {
-          const images = await collectImagesFromPage();
+          const images = await collectImagesFromPage(request.taskId);
           sendResponse({
             success: true,
             images: images,

@@ -150,6 +150,24 @@
 
   <!-- 主体画廊容器 -->
   <main class="gallery-container">
+    <!-- 采集加载中状态 -->
+    <div id="loadingState" class="collector-loading-state hidden">
+      <div class="collector-spinner"></div>
+      <h3 id="loadingStateTitle">正在采集网页图片…</h3>
+      <p class="loading-subtext" id="loadingStateSubtext">正在识别图片并检测真实尺寸，图片较多时可能需要一些时间。</p>
+      <div class="collector-loading-counter hidden" id="loadingProgressCounter">已识别 0 张</div>
+    </div>
+
+    <!-- 采集失败错误状态 -->
+    <div id="errorState" class="collector-error-state hidden">
+      <div class="collector-error-icon">⚠️</div>
+      <h3 id="errorStateTitle">采集失败</h3>
+      <p class="error-subtext" id="errorStateSubtitle">未能从源网页获取图片，请检查网页是否已关闭或刷新重试。</p>
+      <div class="error-actions">
+        <button id="btnRetryCollect" class="btn-retry-action">重试采集</button>
+      </div>
+    </div>
+
     <!-- 空数据占位图 -->
     <div id="emptyState" class="empty-state hidden">
       <div class="empty-icon">🖼️</div>

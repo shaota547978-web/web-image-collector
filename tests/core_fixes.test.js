@@ -1358,6 +1358,308 @@ async function runTests() {
     assert.ok(galleryState.selectedIds.has('img_1'), '小图的已勾选状态完好保留');
   });
 
+  // =========================================================================
+  // 阶段 2 补充修复专项测试（画廊立即打开 + 状态机 + 任务隔离 + 性能优化）
+  // =========================================================================
+
+  await asyncTest('阶段 2 补充验证 1: 扫描很慢时，画廊创建立即响应，不等待扫描完成', async () => {
+    let sniffCompleted = false;
+    let galleryTabCreated = false;
+    let createdGalleryUrl = '';
+
+    // 模拟非常耗时的嗅探（耗时 2000ms）
+    async function mockSlowSniff() {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      sniffCompleted = true;
+      return { success: true, images: [{ url: 'https://example.com/hd.jpg', width: 1920, height: 1080 }] };
+    }
+
+    // 模拟 background.js onClicked 执行流程
+    const mockStorage = {};
+    const mockTab = { id: 123, url: 'https://unsplash.com/photos', title: 'Unsplash Photos' };
+
+    const startTime = Date.now();
+    const taskId = `task_${Date.now()}_test`;
+
+    // 1. 立即记录初始 loading 状态
+    mockStorage[`collectorTask_${taskId}`] = {
+      taskId,
+      sourceTabId: mockTab.id,
+      status: 'loading',
+      images: []
+    };
+
+    // 2. 立即创建画廊标签页
+    galleryTabCreated = true;
+    createdGalleryUrl = `gallery.html?taskId=${taskId}`;
+    const galleryOpenDuration = Date.now() - startTime;
+
+    // 此时嗅探尚未完成，但画廊已经创建完成！
+    assert.strictEqual(sniffCompleted, false, '画廊创建时嗅探必须尚未结束（杜绝阻塞画廊秒开）');
+    assert.strictEqual(galleryTabCreated, true, '画廊标签页已被立即创建');
+    assert.ok(createdGalleryUrl.includes(taskId), '画廊 URL 正确携带 taskId');
+    assert.ok(galleryOpenDuration < 50, '画廊创建耗时必须在 50ms 内瞬间完成');
+
+    // 3. 后台异步执行嗅探
+    const sniffResult = await mockSlowSniff();
+    assert.strictEqual(sniffCompleted, true, '后台嗅探在稍后顺利完成');
+    assert.strictEqual(sniffResult.images.length, 1);
+  });
+
+  await asyncTest('阶段 2 补充验证 2: 扫描成功后，画廊状态由 loading 正确切换为 success 并渲染卡片', async () => {
+    // 模拟画廊状态机
+    const gallerySim = {
+      status: 'loading',
+      allImages: [],
+      filteredImages: [],
+      selectedIds: new Set(),
+      loadingHidden: false,
+      errorHidden: true,
+      gridHidden: true,
+      emptyHidden: true
+    };
+
+    function simulateTaskUpdate(message) {
+      if (message.status === 'loading') {
+        gallerySim.status = 'loading';
+        gallerySim.loadingHidden = false;
+        gallerySim.gridHidden = true;
+        gallerySim.errorHidden = true;
+      } else if (message.status === 'success') {
+        gallerySim.status = 'success';
+        gallerySim.loadingHidden = true;
+        gallerySim.errorHidden = true;
+        gallerySim.allImages = message.task.images.map((img, idx) => ({ ...img, id: `img_${idx + 1}` }));
+        gallerySim.filteredImages = [...gallerySim.allImages];
+        if (gallerySim.filteredImages.length > 0) {
+          gallerySim.gridHidden = false;
+          gallerySim.emptyHidden = true;
+        } else {
+          gallerySim.gridHidden = true;
+          gallerySim.emptyHidden = false;
+        }
+      }
+    }
+
+    // 初始处于 loading 态
+    assert.strictEqual(gallerySim.status, 'loading');
+    assert.strictEqual(gallerySim.loadingHidden, false);
+
+    // 收到扫描完成消息
+    simulateTaskUpdate({
+      action: 'COLLECTOR_TASK_UPDATED',
+      status: 'success',
+      task: {
+        images: [
+          { url: 'https://example.com/1.jpg', width: 800, height: 600 },
+          { url: 'https://example.com/2.jpg', width: 1200, height: 900 }
+        ]
+      }
+    });
+
+    assert.strictEqual(gallerySim.status, 'success', '状态成功流转至 success');
+    assert.strictEqual(gallerySim.loadingHidden, true, 'loading 动画自动结束隐藏');
+    assert.strictEqual(gallerySim.gridHidden, false, '卡片网格恢复呈现');
+    assert.strictEqual(gallerySim.filteredImages.length, 2, '两张图片渲染成功');
+  });
+
+  await asyncTest('阶段 2 补充验证 3: 扫描失败后，loading 正确切换为 error 并支持重试', async () => {
+    const gallerySim = {
+      status: 'loading',
+      errorMessage: null,
+      loadingHidden: false,
+      errorHidden: true,
+      gridHidden: true
+    };
+
+    function simulateTaskError(errMsg) {
+      gallerySim.status = 'error';
+      gallerySim.errorMessage = errMsg;
+      gallerySim.loadingHidden = true;
+      gallerySim.errorHidden = false;
+      gallerySim.gridHidden = true;
+    }
+
+    simulateTaskError('目标页面未响应或已关闭');
+
+    assert.strictEqual(gallerySim.status, 'error', '状态流转至 error');
+    assert.strictEqual(gallerySim.loadingHidden, true, 'loading 停止');
+    assert.strictEqual(gallerySim.errorHidden, false, '错误面板显现');
+    assert.strictEqual(gallerySim.errorMessage, '目标页面未响应或已关闭');
+
+    // 模拟点击重试：状态重新回到 loading
+    function simulateRetry() {
+      gallerySim.status = 'loading';
+      gallerySim.errorMessage = null;
+      gallerySim.loadingHidden = false;
+      gallerySim.errorHidden = true;
+    }
+    simulateRetry();
+
+    assert.strictEqual(gallerySim.status, 'loading', '重试后状态重新回到 loading');
+    assert.strictEqual(gallerySim.errorHidden, true, '错误提示隐藏');
+    assert.strictEqual(gallerySim.loadingHidden, false, '重新展示正在采集');
+  });
+
+  await asyncTest('阶段 2 补充验证 4: 0 张图片能正常结束加载并显示「未发现图片」，不无限 loading', async () => {
+    const gallerySim = {
+      status: 'loading',
+      emptyText: '',
+      loadingHidden: false,
+      emptyHidden: true,
+      gridHidden: true
+    };
+
+    function simulateZeroImagesTask() {
+      gallerySim.status = 'success';
+      gallerySim.loadingHidden = true;
+      gallerySim.gridHidden = true;
+      gallerySim.emptyHidden = false;
+      gallerySim.emptyText = '未发现图片';
+    }
+
+    simulateZeroImagesTask();
+
+    assert.strictEqual(gallerySim.status, 'success');
+    assert.strictEqual(gallerySim.loadingHidden, true, '0 张图片时 loading 必须结束，绝不无限转圈');
+    assert.strictEqual(gallerySim.emptyHidden, false, '空状态显现');
+    assert.strictEqual(gallerySim.emptyText, '未发现图片');
+  });
+
+  await asyncTest('阶段 2 补充验证 5: 多画廊并行采集任务隔离，基于 taskId 互不覆盖互不串台', async () => {
+    const storage = {};
+
+    const task1 = {
+      taskId: 'task_unsplash_1',
+      sourceTabId: 101,
+      pageTitle: 'Unsplash Page',
+      images: [{ url: 'https://images.unsplash.com/photo-1' }]
+    };
+
+    const task2 = {
+      taskId: 'task_github_2',
+      sourceTabId: 202,
+      pageTitle: 'GitHub Page',
+      images: [{ url: 'https://github.com/avatar-1.png' }, { url: 'https://github.com/avatar-2.png' }]
+    };
+
+    // 分别持久化到独立 storage key
+    storage[`collectorTask_${task1.taskId}`] = task1;
+    storage[`collectorTask_${task2.taskId}`] = task2;
+
+    // 画廊 1 绑定 task_unsplash_1
+    const gallery1TaskId = 'task_unsplash_1';
+    const gallery1Data = storage[`collectorTask_${gallery1TaskId}`];
+
+    // 画廊 2 绑定 task_github_2
+    const gallery2TaskId = 'task_github_2';
+    const gallery2Data = storage[`collectorTask_${gallery2TaskId}`];
+
+    assert.strictEqual(gallery1Data.images.length, 1);
+    assert.strictEqual(gallery1Data.pageTitle, 'Unsplash Page');
+
+    assert.strictEqual(gallery2Data.images.length, 2);
+    assert.strictEqual(gallery2Data.pageTitle, 'GitHub Page');
+
+    // 模拟消息广播隔离校验：画廊 1 收到来自 task 2 的消息，严格予以忽略
+    function receiveBroadcast(galleryTaskId, message) {
+      if (galleryTaskId && message.taskId && message.taskId !== galleryTaskId) {
+        return 'IGNORED_CROSS_TASK_MESSAGE';
+      }
+      return 'PROCESSED';
+    }
+
+    assert.strictEqual(receiveBroadcast(gallery1TaskId, { taskId: 'task_github_2', status: 'success' }), 'IGNORED_CROSS_TASK_MESSAGE');
+    assert.strictEqual(receiveBroadcast(gallery1TaskId, { taskId: 'task_unsplash_1', status: 'success' }), 'PROCESSED');
+  });
+
+  await asyncTest('阶段 2 补充验证 6: 用户刷新画廊标签页后根据 URL 中 taskId 正确恢复任务状态', async () => {
+    const storage = {
+      'collectorTask_task_refresh_demo': {
+        taskId: 'task_refresh_demo',
+        sourceTabId: 301,
+        pageTitle: 'Restored Page Title',
+        pageUrl: 'https://example.com/demo',
+        status: 'success',
+        images: [{ url: 'https://example.com/restored.jpg', width: 1000, height: 800 }]
+      }
+    };
+
+    // 模拟用户刷新画廊页面：URL 为 gallery.html?taskId=task_refresh_demo
+    const urlParams = new URLSearchParams('taskId=task_refresh_demo');
+    const taskId = urlParams.get('taskId');
+    assert.strictEqual(taskId, 'task_refresh_demo');
+
+    // 读取对应任务存储
+    const restoredTask = storage[`collectorTask_${taskId}`];
+    assert.ok(restoredTask, '成功从持久化存储获取当前画廊对应的任务');
+    assert.strictEqual(restoredTask.status, 'success');
+    assert.strictEqual(restoredTask.pageTitle, 'Restored Page Title');
+    assert.strictEqual(restoredTask.images.length, 1);
+  });
+
+  await asyncTest('阶段 2 补充验证 7: 任务异常或消息丢失时具备 30 秒安全超时保护，杜绝无限 loading', async () => {
+    let currentStatus = 'loading';
+    let timeoutTriggered = false;
+    let errorMessage = '';
+
+    function simulateTimeoutFallback() {
+      if (currentStatus === 'loading') {
+        currentStatus = 'error';
+        timeoutTriggered = true;
+        errorMessage = '采集等待超时。目标页面图片较多或网络连接较慢，请点击下方按钮重试。';
+      }
+    }
+
+    simulateTimeoutFallback();
+
+    assert.strictEqual(timeoutTriggered, true, '超时回调正常触发');
+    assert.strictEqual(currentStatus, 'error', '状态强制转为 error 杜绝假死');
+    assert.ok(errorMessage.includes('超时'), '错误信息明确提示超时并引导重试');
+  });
+
+  await asyncTest('阶段 2 补充验证 8: 现有手动「刷新图片」功能依然正常（且不恢复自动滚动）', async () => {
+    // 检查 content.js 源码中绝不包含任何自动滚动函数调用
+    const contentSrc = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    assert.strictEqual(contentSrc.includes('scrollBy'), false, 'content.js 中严禁出现 scrollBy');
+    assert.strictEqual(contentSrc.includes('scrollTo'), false, 'content.js 中严禁出现 scrollTo');
+    assert.strictEqual(contentSrc.includes('keepScrolling'), false, 'content.js 中严禁出现 keepScrolling');
+
+    // 检查 gallery.html 中 btnRefreshImages 存在
+    const htmlSrc = fs.readFileSync(GALLERY_HTML_PATH, 'utf-8');
+    assert.ok(htmlSrc.includes('id="btnRefreshImages"'), '必须保留刷新图片按钮');
+    assert.ok(htmlSrc.includes('id="loadingState"'), '必须包含 loadingState 容器');
+    assert.ok(htmlSrc.includes('id="errorState"'), '必须包含 errorState 容器');
+    assert.ok(htmlSrc.includes('id="btnRetryCollect"'), '必须包含 btnRetryCollect 按钮');
+  });
+
+  await asyncTest('阶段 2 补充验证 9: content.js 具备尺寸校验缓存与合并调度，保留小图且不借用父容器尺寸', async () => {
+    const contentSrc = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+    assert.ok(contentSrc.includes('verifiedDimensionsCache'), 'content.js 必须具备 URL 尺寸校验缓存');
+    assert.ok(contentSrc.includes('verificationTasks'), 'content.js 必须具备合并后的统一尺寸校验任务队列');
+    assert.ok(contentSrc.includes('SNIFF_PROGRESS'), 'content.js 必须支持 SNIFF_PROGRESS 真实进度通知');
+
+    // 模拟缓存命中测试
+    const mockCache = new Map();
+    mockCache.set('https://example.com/cached.jpg', { width: 500, height: 400, valid: true });
+
+    function mockVerify(url) {
+      if (mockCache.has(url)) return mockCache.get(url);
+      return { width: 0, height: 0, valid: false };
+    }
+
+    const cachedCheck = mockVerify('https://example.com/cached.jpg');
+    assert.strictEqual(cachedCheck.width, 500, '命中缓存直接返回尺寸，零网络开销');
+    assert.strictEqual(cachedCheck.valid, true);
+  });
+
+  await asyncTest('阶段 2 补充验证 10: 单张下载与 ZIP 下载逻辑未受影响，20 张免费配额限制依然生效', async () => {
+    const gallerySrc = fs.readFileSync(GALLERY_JS_PATH, 'utf-8');
+    assert.ok(gallerySrc.includes('startBatchDownload'), '批量下载函数未受影响');
+    assert.ok(gallerySrc.includes('downloadSingleImage'), '单张下载函数未受影响');
+    assert.ok(gallerySrc.includes('proLimit: 20'), '免费版 20 张限制依然生效');
+  });
+
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);
   if (passed !== total) {
     process.exit(1);

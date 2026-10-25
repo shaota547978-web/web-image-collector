@@ -41,7 +41,12 @@
     sourceTabId: null,
     pageUrl: '',
     taskCollectedAt: null,
-    isRefreshing: false
+    isRefreshing: false,
+
+    // 任务隔离与状态机
+    taskId: null,
+    taskStatus: 'loading',        // 'loading' | 'success' | 'error'
+    loadingTimeoutTimer: null
   };
 
   const MAX_CONCURRENCY = 3;
@@ -96,6 +101,17 @@
     emptyState: document.getElementById('emptyState'),
     emptySubtext: document.getElementById('emptySubtext'),
     galleryGrid: document.getElementById('galleryGrid'),
+
+    // 采集加载中状态与失败重试
+    loadingState: document.getElementById('loadingState'),
+    loadingStateTitle: document.getElementById('loadingStateTitle'),
+    loadingStateSubtext: document.getElementById('loadingStateSubtext'),
+    loadingProgressCounter: document.getElementById('loadingProgressCounter'),
+
+    errorState: document.getElementById('errorState'),
+    errorStateTitle: document.getElementById('errorStateTitle'),
+    errorStateSubtitle: document.getElementById('errorStateSubtitle'),
+    btnRetryCollect: document.getElementById('btnRetryCollect'),
 
     // 穿透进度面板（入口停用）
     deepGrabConsole: document.getElementById('deepGrabConsole'),
@@ -367,12 +383,139 @@
   // -------------------------------------------------------------
   async function init() {
     bindEvents();
+    bindTaskMessageListener();
 
     // 检查 Pro 授权状态
     await loadProStatus();
 
     // 读取嗅探任务数据
     await loadCollectorTaskData();
+  }
+
+  function clearLoadingTimeout() {
+    if (state.loadingTimeoutTimer) {
+      clearTimeout(state.loadingTimeoutTimer);
+      state.loadingTimeoutTimer = null;
+    }
+  }
+
+  function showLoadingState(message, count) {
+    state.taskStatus = 'loading';
+    clearLoadingTimeout();
+
+    if (dom.loadingState) {
+      dom.loadingState.classList.remove('hidden');
+    }
+    if (dom.errorState) {
+      dom.errorState.classList.add('hidden');
+    }
+    if (dom.emptyState) {
+      dom.emptyState.classList.add('hidden');
+    }
+    if (dom.galleryGrid) {
+      dom.galleryGrid.classList.add('hidden');
+    }
+
+    if (dom.loadingStateTitle && message) {
+      dom.loadingStateTitle.textContent = message;
+    }
+
+    if (count != null && count > 0 && dom.loadingProgressCounter) {
+      dom.loadingProgressCounter.textContent = `已识别 ${count} 张`;
+      dom.loadingProgressCounter.classList.remove('hidden');
+    } else if (dom.loadingProgressCounter) {
+      dom.loadingProgressCounter.classList.add('hidden');
+    }
+
+    // 防假死安全超时：30秒后若仍处于 loading，切换为 error 状态
+    state.loadingTimeoutTimer = setTimeout(() => {
+      if (state.taskStatus === 'loading') {
+        showErrorState('采集等待超时。目标页面图片较多或网络连接较慢，请点击下方按钮重试。');
+      }
+    }, 30000);
+  }
+
+  function showErrorState(errorMessage) {
+    state.taskStatus = 'error';
+    clearLoadingTimeout();
+
+    if (dom.loadingState) {
+      dom.loadingState.classList.add('hidden');
+    }
+    if (dom.galleryGrid) {
+      dom.galleryGrid.classList.add('hidden');
+    }
+    if (dom.emptyState) {
+      dom.emptyState.classList.add('hidden');
+    }
+    if (dom.errorState) {
+      dom.errorState.classList.remove('hidden');
+    }
+    if (dom.errorStateSubtitle) {
+      dom.errorStateSubtitle.textContent = errorMessage || '未能从源网页获取图片，请检查网页是否已关闭或刷新重试。';
+    }
+    if (dom.btnRetryCollect) {
+      dom.btnRetryCollect.disabled = false;
+      dom.btnRetryCollect.textContent = '重试采集';
+    }
+  }
+
+  function showSuccessState() {
+    state.taskStatus = 'success';
+    clearLoadingTimeout();
+
+    if (dom.loadingState) {
+      dom.loadingState.classList.add('hidden');
+    }
+    if (dom.errorState) {
+      dom.errorState.classList.add('hidden');
+    }
+
+    if (state.allImages.length === 0) {
+      renderEmptyState('未发现图片');
+    } else {
+      if (dom.galleryGrid) {
+        dom.galleryGrid.classList.remove('hidden');
+      }
+      renderGallery();
+    }
+  }
+
+  // 监听后台任务状态广播与实时嗅探进度通知
+  function bindTaskMessageListener() {
+    chrome.runtime.onMessage.addListener((message) => {
+      if (!message || !message.action) return;
+
+      // 任务隔离校验：若当前画廊已绑定 taskId，且收到的消息带有 taskId，两者必须匹配！杜绝串台！
+      if (state.taskId && message.taskId && message.taskId !== state.taskId) {
+        return;
+      }
+
+      if (message.action === 'COLLECTOR_TASK_UPDATED') {
+        if (message.status === 'loading') {
+          showLoadingState('正在采集网页图片…');
+        } else if (message.status === 'success') {
+          if (message.task) {
+            processTaskImages(message.task);
+          } else if (state.taskId) {
+            chrome.storage.local.get([`collectorTask_${state.taskId}`]).then(res => {
+              if (res && res[`collectorTask_${state.taskId}`]) {
+                processTaskImages(res[`collectorTask_${state.taskId}`]);
+              }
+            });
+          }
+        } else if (message.status === 'error') {
+          showErrorState(message.error || '采集失败，请重试');
+        }
+      } else if (message.action === 'SNIFF_PROGRESS') {
+        if (state.taskStatus === 'loading' && typeof message.count === 'number') {
+          if (dom.loadingProgressCounter) {
+            dom.loadingProgressCounter.textContent = `已识别 ${message.count} 张`;
+            dom.loadingProgressCounter.classList.remove('hidden');
+          }
+        }
+      }
+    });
   }
 
   async function loadProStatus() {
@@ -406,16 +549,31 @@
 
   async function loadCollectorTaskData() {
     try {
-      const result = await chrome.storage.local.get(['currentCollectorTask']);
-      const task = result ? result.currentCollectorTask : null;
-
-      if (!task || !task.images || task.images.length === 0) {
-        if (task && task.warning) {
-          showAlert(task.warning);
-        } else {
-          showAlert('未检测到可用的网页采集数据。请在目标网页上点击扩展图标触发采集。');
+      // 1. 从 URL 查询参数获取绑定 taskId，或从 latestTaskId 兜底
+      const urlParams = new URLSearchParams(window.location.search);
+      let taskId = urlParams.get('taskId');
+      if (!taskId) {
+        const latestRes = await chrome.storage.local.get(['latestTaskId']);
+        if (latestRes && latestRes.latestTaskId) {
+          taskId = latestRes.latestTaskId;
         }
-        renderEmptyState('未找到图片数据');
+      }
+      state.taskId = taskId;
+
+      // 2. 根据 taskId 读取隔离的任务数据，或者向下兼容 currentCollectorTask
+      let task = null;
+      if (taskId) {
+        const storageKey = `collectorTask_${taskId}`;
+        const res = await chrome.storage.local.get([storageKey]);
+        task = res ? res[storageKey] : null;
+      }
+      if (!task) {
+        const res = await chrome.storage.local.get(['currentCollectorTask']);
+        task = res ? res.currentCollectorTask : null;
+      }
+
+      if (!task) {
+        showErrorState('未检测到可用的采集任务。请在目标网页上点击扩展图标触发采集。');
         return;
       }
 
@@ -427,71 +585,114 @@
         state.pageUrl = task.pageUrl;
       }
       state.sourceTabId = task.sourceTabId || null;
-      state.taskCollectedAt = task.collectedAt || null;
+      state.taskCollectedAt = task.createdAt || task.completedAt || null;
 
-      if (task.warning) {
-        showAlert(task.warning);
+      // 3. 判断任务状态 (loading / error / success)
+      if (task.status === 'loading') {
+        showLoadingState('正在采集网页图片…');
+        return;
       }
 
-      // 修复 1：采用完整、有效的图片 URL 判断重复，绝不删除 ? 后的查询参数，确保不同 id/sign/token 的图片不被合并
-      const dedupeMap = new Map();
-      task.images.forEach(img => {
-        if (!img || !img.url) return;
-        const rawUrl = img.url.trim();
-        if (!rawUrl) return;
+      if (task.status === 'error') {
+        showErrorState(task.error || task.warning || '采集失败');
+        return;
+      }
 
-        // 统一在画廊层执行白名单 CDN 高清增强，并严格保留 originalUrl 与 fallbackUrl
-        const originalUrl = img.originalUrl || rawUrl;
-        const fallbackUrl = img.fallbackUrl || null;
-        const enhancedUrl = enhanceToHighResUrl(originalUrl);
-
-        // 去重主键以完整的原始 URL 规范化标识（杜绝截断 query 导致不同图片被合并）
-        const dedupeKey = rawUrl;
-        const currentScore = Math.max(img.width || 0, img.height || 0);
-
-        if (dedupeMap.has(dedupeKey)) {
-          const existing = dedupeMap.get(dedupeKey);
-          const existingScore = Math.max(existing.width || 0, existing.height || 0);
-          if (currentScore > existingScore) {
-            existing.width = Math.max(existing.width || 0, img.width || 0);
-            existing.height = Math.max(existing.height || 0, img.height || 0);
-          }
-          if (!existing.alt && img.alt) existing.alt = img.alt;
-          if (!existing.fallbackUrl && fallbackUrl) existing.fallbackUrl = fallbackUrl;
-          if (!existing.originalUrl && originalUrl) existing.originalUrl = originalUrl;
-          if (!existing.detailUrl && img.detailUrl) {
-            existing.detailUrl = img.detailUrl;
-            existing.hasDetailLink = true;
-          }
-        } else {
-          dedupeMap.set(dedupeKey, {
-            ...img,
-            url: enhancedUrl, // 优先尝试超清增强地址
-            originalUrl: originalUrl, // 保留原始未增强地址用于下载失败自动回退
-            fallbackUrl: fallbackUrl, // 保留 DOM 级主图降级地址
-            detailUrl: img.detailUrl || null,
-            hasDetailLink: !!img.detailUrl
-          });
-        }
-      });
-
-      // 统一图片身份管理：每张去重后的图片分配唯一全局 id (如 img_1, img_2...)
-      // 保证画廊展示、多选集合、下载队列、卡片 UI 状态与错误报告一一对应，杜绝增强后 URL 相同导致的覆盖
-      state.allImages = Array.from(dedupeMap.values()).map((item, idx) => ({
-        ...item,
-        id: `img_${idx + 1}`
-      }));
-
-      // 默认全选前 20 张（或全部若小于 20 张）
-      applyFilters();
-      preselectInitialImages();
-      updateDeepGrabButtonBadge();
+      // 4. status === 'success' 或已有结果数据
+      processTaskImages(task);
 
     } catch (err) {
       console.error('[Gallery] 读取存储数据失败:', err);
-      showAlert(`读取图片数据失败: ${err.message}`);
-      renderEmptyState('读取数据失败');
+      showErrorState(`读取图片数据失败: ${err.message}`);
     }
+  }
+
+  function processTaskImages(task) {
+    if (!task) return;
+
+    if (task.pageTitle) {
+      dom.sourceTitle.textContent = task.pageTitle;
+      dom.sourceTitle.title = task.pageTitle;
+    }
+    if (task.pageUrl) {
+      dom.sourceLink.href = task.pageUrl;
+      state.pageUrl = task.pageUrl;
+    }
+    if (task.sourceTabId) {
+      state.sourceTabId = task.sourceTabId;
+    }
+    if (task.createdAt || task.completedAt) {
+      state.taskCollectedAt = task.completedAt || task.createdAt;
+    }
+
+    if (task.warning) {
+      showAlert(task.warning);
+    }
+
+    const rawImages = Array.isArray(task.images) ? task.images : [];
+    if (rawImages.length === 0) {
+      state.allImages = [];
+      state.filteredImages = [];
+      state.selectedIds.clear();
+      updateSelectionSummary();
+      showSuccessState();
+      return;
+    }
+
+    // 修复 1：采用完整、有效的图片 URL 判断重复，绝不删除 ? 后的查询参数，确保不同 id/sign/token 的图片不被合并
+    const dedupeMap = new Map();
+    rawImages.forEach(img => {
+      if (!img || !img.url) return;
+      const rawUrl = img.url.trim();
+      if (!rawUrl) return;
+
+      // 统一在画廊层执行白名单 CDN 高清增强，并严格保留 originalUrl 与 fallbackUrl
+      const originalUrl = img.originalUrl || rawUrl;
+      const fallbackUrl = img.fallbackUrl || null;
+      const enhancedUrl = enhanceToHighResUrl(originalUrl);
+
+      // 去重主键以完整的原始 URL 规范化标识（杜绝截断 query 导致不同图片被合并）
+      const dedupeKey = rawUrl;
+      const currentScore = Math.max(img.width || 0, img.height || 0);
+
+      if (dedupeMap.has(dedupeKey)) {
+        const existing = dedupeMap.get(dedupeKey);
+        const existingScore = Math.max(existing.width || 0, existing.height || 0);
+        if (currentScore > existingScore) {
+          existing.width = Math.max(existing.width || 0, img.width || 0);
+          existing.height = Math.max(existing.height || 0, img.height || 0);
+        }
+        if (!existing.alt && img.alt) existing.alt = img.alt;
+        if (!existing.fallbackUrl && fallbackUrl) existing.fallbackUrl = fallbackUrl;
+        if (!existing.originalUrl && originalUrl) existing.originalUrl = originalUrl;
+        if (!existing.detailUrl && img.detailUrl) {
+          existing.detailUrl = img.detailUrl;
+          existing.hasDetailLink = true;
+        }
+      } else {
+        dedupeMap.set(dedupeKey, {
+          ...img,
+          url: enhancedUrl, // 优先尝试超清增强地址
+          originalUrl: originalUrl, // 保留原始未增强地址用于下载失败自动回退
+          fallbackUrl: fallbackUrl, // 保留 DOM 级主图降级地址
+          detailUrl: img.detailUrl || null,
+          hasDetailLink: !!img.detailUrl
+        });
+      }
+    });
+
+    // 统一图片身份管理：每张去重后的图片分配唯一全局 id (如 img_1, img_2...)
+    // 保证画廊展示、多选集合、下载队列、卡片 UI 状态与错误报告一一对应，杜绝增强后 URL 相同导致的覆盖
+    state.allImages = Array.from(dedupeMap.values()).map((item, idx) => ({
+      ...item,
+      id: `img_${idx + 1}`
+    }));
+
+    // 默认全选前 20 张（或全部若小于 20 张）
+    applyFilters();
+    preselectInitialImages();
+    updateDeepGrabButtonBadge();
+    showSuccessState();
   }
 
   function preselectInitialImages() {
@@ -892,6 +1093,7 @@
   }
 
   function renderGallery() {
+    const tRender0 = performance.now();
     dom.galleryGrid.innerHTML = '';
 
     if (state.filteredImages.length === 0) {
@@ -1048,6 +1250,8 @@
     });
 
     dom.galleryGrid.appendChild(fragment);
+    const tRender1 = performance.now();
+    console.log(`[Web Image Collector Perf] 画廊卡片渲染耗时: ${(tRender1 - tRender0).toFixed(1)}ms (渲染卡片数: ${state.filteredImages.length})`);
   }
 
   function renderEmptyState(subtext) {
@@ -1126,7 +1330,8 @@
       let response = null;
       try {
         response = await chrome.tabs.sendMessage(sourceTab.id, {
-          action: 'SNIFF_IMAGES'
+          action: 'SNIFF_IMAGES',
+          taskId: state.taskId
         });
       } catch {
         // 通信未就绪时（例如页面手动重载过），动态注入 content.js 后重试一次
@@ -1136,7 +1341,8 @@
             files: ['content.js']
           });
           response = await chrome.tabs.sendMessage(sourceTab.id, {
-            action: 'SNIFF_IMAGES'
+            action: 'SNIFF_IMAGES',
+            taskId: state.taskId
           });
         } catch (injectErr) {
           console.warn('[Gallery] 注入 content.js 单次嗅探失败:', injectErr);
@@ -1241,15 +1447,26 @@
 
     // 持久化到 storage.local 并校验绑定当前采集任务，避免污染其他画廊标签页
     try {
-      chrome.storage.local.get(['currentCollectorTask']).then(res => {
+      const keys = state.taskId ? [`collectorTask_${state.taskId}`, 'currentCollectorTask'] : ['currentCollectorTask'];
+      chrome.storage.local.get(keys).then(res => {
+        const updates = {};
+        if (state.taskId && res && res[`collectorTask_${state.taskId}`]) {
+          const t = res[`collectorTask_${state.taskId}`];
+          t.images = state.allImages;
+          updates[`collectorTask_${state.taskId}`] = t;
+        }
         if (res && res.currentCollectorTask) {
           const currentTask = res.currentCollectorTask;
-          const isSameTask = (!state.taskCollectedAt || currentTask.collectedAt === state.taskCollectedAt)
-            && (!state.pageUrl || currentTask.pageUrl === state.pageUrl);
+          const isSameTask = (!state.taskId || currentTask.taskId === state.taskId) ||
+            ((!state.taskCollectedAt || currentTask.collectedAt === state.taskCollectedAt)
+            && (!state.pageUrl || currentTask.pageUrl === state.pageUrl));
           if (isSameTask) {
             currentTask.images = state.allImages;
-            chrome.storage.local.set({ currentCollectorTask });
+            updates.currentCollectorTask = currentTask;
           }
+        }
+        if (Object.keys(updates).length > 0) {
+          chrome.storage.local.set(updates);
         }
       }).catch(() => {});
     } catch {}
@@ -2322,6 +2539,30 @@
     // 刷新图片（单次扫描原网页 DOM 增量发现新图）
     if (dom.btnRefreshImages) {
       dom.btnRefreshImages.addEventListener('click', refreshImages);
+    }
+
+    // 失败重试采集
+    if (dom.btnRetryCollect) {
+      dom.btnRetryCollect.addEventListener('click', async () => {
+        if (!state.taskId) {
+          showAlert('未找到当前任务 ID，无法重试');
+          return;
+        }
+        dom.btnRetryCollect.disabled = true;
+        dom.btnRetryCollect.textContent = '正在重新启动...';
+        showLoadingState('正在重新采集网页图片…');
+        try {
+          const resp = await chrome.runtime.sendMessage({
+            action: 'RETRY_COLLECT_TASK',
+            taskId: state.taskId
+          });
+          if (!resp || !resp.success) {
+            showErrorState((resp && resp.error) || '重试失败，请确保来源标签页未关闭');
+          }
+        } catch (err) {
+          showErrorState('重试请求发送失败: ' + err.message);
+        }
+      });
     }
 
     // 核心下载
