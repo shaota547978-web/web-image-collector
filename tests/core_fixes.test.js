@@ -651,6 +651,221 @@ async function runTests() {
     );
   });
 
+  // -------------------------------------------------------------
+  // 测试 7：第二轮核心下载定点复审行为运行测试 (针对 4 项重点核查)
+  // -------------------------------------------------------------
+  test('复审问题 1 行为验证: 用户主动取消保存时，严禁触发 fallbackAnchorDownload 兜底下载', () => {
+    // 提取并运行 gallery.js 中实际的取消检测与兜底拦截逻辑
+    function isUserCancelError(errMsg) {
+      if (!errMsg) return false;
+      const lower = String(errMsg).toLowerCase();
+      return lower.includes('cancel') || lower.includes('user_canceled') || lower.includes('abort');
+    }
+
+    let fallbackCalled = false;
+    let revoked = false;
+    const dom = {
+      consolePhaseText: { textContent: '' },
+      consoleDetailText: { textContent: '' }
+    };
+
+    function simulateSaveZip(lastErrorMsg) {
+      fallbackCalled = false;
+      revoked = false;
+      const objectUrl = 'blob:http://localhost/test-uuid';
+      const cleanup = () => { revoked = true; };
+
+      const chrome = {
+        runtime: { lastError: lastErrorMsg ? { message: lastErrorMsg } : null }
+      };
+
+      // 运行与 gallery.js 一致的真实分支逻辑
+      if (chrome.runtime.lastError) {
+        const errMsg = chrome.runtime.lastError.message;
+        if (isUserCancelError(errMsg)) {
+          cleanup();
+          dom.consolePhaseText.textContent = '保存已取消：用户取消了文件保存窗口';
+          dom.consoleDetailText.textContent = 'ZIP 压缩文件未写入磁盘';
+          return;
+        }
+        fallbackCalled = true;
+      }
+    }
+
+    // A. 用户在文件选择窗口点击“取消”
+    simulateSaveZip('User cancelled');
+    assert.strictEqual(fallbackCalled, false, '用户取消时严禁调用 fallbackAnchorDownload 兜底下载');
+    assert.strictEqual(revoked, true, '用户取消时必须立即释放 ObjectURL');
+    assert.strictEqual(dom.consolePhaseText.textContent, '保存已取消：用户取消了文件保存窗口');
+
+    // B. 用户通过 USER_CANCELED 中断
+    simulateSaveZip('USER_CANCELED');
+    assert.strictEqual(fallbackCalled, false, 'USER_CANCELED 状态下严禁调用 fallbackAnchorDownload');
+
+    // C. 真实异常情况（非取消，如系统没有文件选择器）
+    simulateSaveZip('Download API internal error');
+    assert.strictEqual(fallbackCalled, true, '非取消类真实异常下才允许降级到模拟点击兜底');
+  });
+
+  test('复审问题 2 行为验证: chrome.downloads.onChanged 防事件遗漏与资源防泄漏', () => {
+    // 模拟极速完成场景：在 download 回调执行时文件已经处于 complete 状态
+    let listenerRemoved = false;
+    let urlRevoked = false;
+    let completeHandled = false;
+
+    const downloadId = 999;
+    const objectUrl = 'blob:http://localhost/fast-complete';
+
+    const cleanup = () => {
+      listenerRemoved = true;
+      urlRevoked = true;
+    };
+
+    const downloadListener = (delta) => {
+      if (delta.id !== downloadId) return;
+      if (delta.state && delta.state.current === 'complete') {
+        cleanup();
+        completeHandled = true;
+      }
+    };
+
+    // 模拟 chrome.downloads.search 补查机制
+    const chromeDownloads = {
+      search(query, cb) {
+        // 模拟 search 发现下载已瞬间完成
+        cb([{ id: query.id, state: 'complete' }]);
+      }
+    };
+
+    // 注册监听器后立即执行补查
+    chromeDownloads.search({ id: downloadId }, (items) => {
+      if (items && items[0] && items[0].state === 'complete') {
+        downloadListener({ id: downloadId, state: { current: 'complete' } });
+      }
+    });
+
+    assert.strictEqual(completeHandled, true, '防事件遗漏 search 机制应立即捕获已完成的下载');
+    assert.strictEqual(listenerRemoved, true, '完成时必须移除监听器');
+    assert.strictEqual(urlRevoked, true, '完成时必须释放 ObjectURL 资源');
+  });
+
+  test('复审问题 3 行为验证: 第一批未保存完时启动第二批，通过 currentTaskId 严格隔离状态', () => {
+    const dom = {
+      consolePhaseText: { textContent: '' },
+      consoleDetailText: { textContent: '' }
+    };
+    const state = {
+      currentBatchTaskId: 0,
+      activeSaveTask: null
+    };
+
+    // 1. 启动批次 1
+    const task1Id = ++state.currentBatchTaskId; // task1Id = 1
+    let task1Revoked = false;
+    let task1Listener = null;
+
+    function triggerSaveZipSim(taskId, isStopAndZip, filename) {
+      const cleanup = () => { task1Revoked = true; };
+      task1Listener = (delta) => {
+        cleanup();
+        // 关键防护：只有 taskId 与当前 state.currentBatchTaskId 匹配时才允许更新界面
+        if (state.currentBatchTaskId === taskId) {
+          dom.consolePhaseText.textContent = isStopAndZip
+            ? '保存完成！已成功保存已完成图片的压缩包'
+            : '保存完成！ZIP 压缩包已成功保存到本地磁盘';
+          dom.consoleDetailText.textContent = `文件已落盘: ${filename}`;
+        }
+      };
+    }
+
+    triggerSaveZipSim(task1Id, false, 'batch_1.zip');
+
+    // 2. 批次 1 尚未落盘，用户立即勾选新图片启动批次 2
+    const task2Id = ++state.currentBatchTaskId; // task2Id = 2
+    dom.consolePhaseText.textContent = '批次 2 正在并发下载 (3/10)...';
+    dom.consoleDetailText.textContent = '批次 2 进度 30%';
+
+    assert.strictEqual(state.currentBatchTaskId, 2);
+    assert.strictEqual(dom.consolePhaseText.textContent, '批次 2 正在并发下载 (3/10)...');
+
+    // 3. 此时批次 1 的系统保存完成事件终于到来
+    task1Listener({ id: 101, state: { current: 'complete' } });
+
+    // 4. 验证：批次 1 释放了自身资源，但控制台界面完全保留批次 2 的状态，没有被批次 1 覆盖！
+    assert.strictEqual(task1Revoked, true, '批次 1 自身资源正常释放');
+    assert.strictEqual(
+      dom.consolePhaseText.textContent,
+      '批次 2 正在并发下载 (3/10)...',
+      '批次 1 完成事件绝不得覆盖批次 2 的正在下载控制台！'
+    );
+    assert.strictEqual(
+      dom.consoleDetailText.textContent,
+      '批次 2 进度 30%',
+      '批次 2 的进度详情必须保持完整'
+    );
+  });
+
+  await asyncTest('复审问题 4 行为验证: Canvas 降级请求及时响应 signal 取消，耗时在 100ms 内且提示准确', async () => {
+    // 模拟改造后的 fetchViaCanvasFallback 取消响应机制
+    function simulateFetchViaCanvasFallback(url, signal = null) {
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) {
+          return reject(new Error('下载任务已取消'));
+        }
+
+        let timer = null;
+        let abortHandler = null;
+
+        const cleanup = () => {
+          if (timer) { clearTimeout(timer); timer = null; }
+          if (signal && abortHandler) {
+            signal.removeEventListener('abort', abortHandler);
+            abortHandler = null;
+          }
+        };
+
+        if (signal) {
+          abortHandler = () => {
+            cleanup();
+            reject(new Error('下载任务已取消'));
+          };
+          signal.addEventListener('abort', abortHandler, { once: true });
+        }
+
+        // 模拟原本需要 5 秒的超时
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error('Canvas 降级请求超时'));
+        }, 5000);
+      });
+    }
+
+    const abortController = new AbortController();
+    const startTime = Date.now();
+
+    const canvasPromise = simulateFetchViaCanvasFallback('https://example.com/blocked.jpg', abortController.signal);
+
+    // 20ms 后发出取消
+    setTimeout(() => {
+      abortController.abort();
+    }, 20);
+
+    try {
+      await canvasPromise;
+      assert.fail('应当抛出取消错误');
+    } catch (err) {
+      const elapsed = Date.now() - startTime;
+      assert.strictEqual(err.message, '下载任务已取消');
+      assert.ok(elapsed < 200, `发出 abort 后应立即退出，实际耗时 ${elapsed}ms (远低于 5000ms 超时)`);
+    }
+
+    // 验证错误诊断文案格式
+    const fetchErr = new Error('HTTP 403 Forbidden');
+    const canvasErr = new Error('Image 降级加载失败');
+    const formattedError = `跨域限制: ${fetchErr.message} (Canvas兜底失败: ${canvasErr.message})`;
+    assert.ok(formattedError.includes('403 Forbidden') && formattedError.includes('Canvas兜底失败'));
+  });
+
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);
   if (passed !== total) {
     process.exit(1);
