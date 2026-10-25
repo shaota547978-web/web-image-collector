@@ -10,7 +10,7 @@
   // 1. 全局状态
   // -------------------------------------------------------------
   const state = {
-    allImages: [],           // 嗅探到的所有图片列表 [{ id, url, originalUrl, fallbackUrl, width, height, alt, source }]
+    allImages: [],           // 嗅探到的所有图片列表 [{ id, url, originalUrl, fallbackUrl, width, height, alt, source, detailUrl, hasDetailLink, deepGrabStatus }]
     filteredImages: [],      // 当前符合滑块与格式条件的图片列表
     selectedIds: new Set(),  // 当前已勾选的图片 ID (统一身份管理，杜绝与下载 URL 混用)
     isPro: false,            // 是否激活 Pro License
@@ -18,6 +18,10 @@
     minWidth: 200,           // 默认最小过滤门槛 200px
     minHeight: 200,          // 默认最小过滤门槛 200px
     currentFormat: 'ALL',
+
+    // 深度穿透 (Deep Grab) 运行时状态
+    isDeepGrabbing: false,
+    deepGrabCancelRequested: false,
 
     // 下载运行时状态
     isDownloading: false,
@@ -31,6 +35,7 @@
   };
 
   const MAX_CONCURRENCY = 3;
+  const MAX_DEEP_CONCURRENCY = 2; // 穿透详情页严格限制为 2 并发，防止请求过频触发风控
   const QUOTA_LIMIT_BYTES = 150 * 1024 * 1024; // 150MB 下载数据量保护阈值
 
   // -------------------------------------------------------------
@@ -457,6 +462,7 @@
       // 默认全选前 20 张（或全部若小于 20 张）
       applyFilters();
       preselectInitialImages();
+      updateDeepGrabButtonBadge();
 
     } catch (err) {
       console.error('[Gallery] 读取存储数据失败:', err);
@@ -476,11 +482,352 @@
   }
 
   // -------------------------------------------------------------
-  // 原图穿透 (Deep Grab) 辅助（本轮停用入口与穿透请求，保留结构兼容）
+  // 原图穿透 (Deep Grab) 辅助与启发式解析算法
   // -------------------------------------------------------------
+  function updateDeepGrabButtonBadge() {
+    if (!dom.btnDeepGrab) return;
+    const pendingCount = state.allImages.filter(img => img.hasDetailLink && img.detailUrl && img.deepGrabStatus !== 'success').length;
+    if (pendingCount > 0) {
+      dom.btnDeepGrab.classList.remove('hidden');
+      dom.deepGrabText.textContent = `深度穿透 (${pendingCount})`;
+      dom.deepGrabBadge.textContent = pendingCount;
+    } else {
+      const successCount = state.allImages.filter(img => img.deepGrabStatus === 'success').length;
+      if (successCount > 0) {
+        dom.btnDeepGrab.classList.remove('hidden');
+        dom.deepGrabText.textContent = `穿透完成 (${successCount})`;
+        dom.deepGrabBadge.textContent = '✓';
+      } else {
+        dom.btnDeepGrab.classList.add('hidden');
+      }
+    }
+  }
+
   function renderDeepGrabBadge(img) {
-    // 本轮按要求暂时停用 Deep Grab 视觉标签展示
-    return '';
+    if (!img.hasDetailLink && !img.detailUrl) return '';
+
+    if (img.deepGrabStatus === 'success') {
+      const label = img.is4K ? '⚡ 4K 原图' : '⚡ HD 原图';
+      return `<span class="badge-deep-grab success" title="已成功穿透详情页提取最高画质原图">${label}</span>`;
+    }
+    if (img.deepGrabStatus === 'resolving') {
+      return `<span class="badge-deep-grab resolving">⚡ 解析中...</span>`;
+    }
+    if (img.deepGrabStatus === 'fallback') {
+      return `<span class="badge-deep-grab fallback" title="详情页未发现更高清大图，已保留预览图">已保持预览图</span>`;
+    }
+    // 待穿透状态
+    return `<span class="badge-deep-grab ready" title="检测到详情页：${escapeHtml(img.detailUrl)}，点击顶部深度穿透提取原画">⚡ 可提取原图</span>`;
+  }
+
+  function updateCardDeepGrabUI(item, cardEl) {
+    const card = cardEl || dom.galleryGrid.querySelector(`.image-card[data-id="${CSS.escape(item.id)}"]`);
+    if (!card) return;
+
+    let badge = card.querySelector('.badge-deep-grab');
+    const badgeHtml = renderDeepGrabBadge(item);
+
+    if (!badgeHtml) {
+      if (badge) badge.remove();
+      return;
+    }
+
+    if (!badge) {
+      const thumb = card.querySelector('.card-thumb-wrapper');
+      if (thumb) {
+        const temp = document.createElement('div');
+        temp.innerHTML = badgeHtml;
+        badge = temp.firstElementChild;
+        if (badge) thumb.appendChild(badge);
+      }
+    } else {
+      badge.outerHTML = badgeHtml;
+    }
+  }
+
+  function updateCardWithResolvedHero(item, oldUrl) {
+    const card = dom.galleryGrid.querySelector(`.image-card[data-id="${CSS.escape(item.id)}"]`);
+    if (!card) return;
+
+    card.dataset.url = item.url;
+
+    const imgEl = card.querySelector('.card-thumb-wrapper img');
+    if (imgEl) {
+      imgEl.src = item.url;
+      delete imgEl.dataset.fallbackAttempted;
+      const fallbackUrl = item.originalUrl || oldUrl;
+      if (fallbackUrl && fallbackUrl !== item.url) {
+        imgEl.addEventListener('error', function onHeroFallbackError() {
+          if (this.dataset.fallbackAttempted === 'true') return;
+          this.dataset.fallbackAttempted = 'true';
+          this.src = fallbackUrl;
+        }, { once: true });
+      }
+    }
+
+    const resBadge = card.querySelector('.badge-res');
+    if (resBadge) {
+      const isLarge = (item.width >= 1000 || item.height >= 1000);
+      resBadge.textContent = (item.width > 0 && item.height > 0) ? `${item.width} × ${item.height}` : '未知尺寸';
+      if (isLarge) resBadge.classList.add('large-res');
+    }
+
+    const fmtBadge = card.querySelector('.badge-fmt');
+    if (fmtBadge) {
+      fmtBadge.textContent = detectImageFormat(item);
+    }
+
+    updateCardDeepGrabUI(item, card);
+  }
+
+  function preloadImageDimensions(url) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const timer = setTimeout(() => {
+        resolve({ width: 0, height: 0 });
+      }, 5000);
+
+      img.onload = () => {
+        clearTimeout(timer);
+        resolve({
+          width: img.naturalWidth || img.width || 0,
+          height: img.naturalHeight || img.height || 0
+        });
+      };
+
+      img.onerror = () => {
+        clearTimeout(timer);
+        resolve({ width: 0, height: 0 });
+      };
+
+      img.src = url;
+    });
+  }
+
+  /**
+   * 详情页 HTML 解析与“主角图”启发式算法
+   */
+  async function resolveHeroImageFromDetail(detailUrl) {
+    if (!detailUrl) return null;
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      const resp = await fetch(detailUrl, {
+        method: 'GET',
+        signal: controller.signal,
+        credentials: 'omit',
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        }
+      });
+      clearTimeout(timeoutId);
+
+      if (!resp.ok) return null;
+      const htmlText = await resp.text();
+      if (!htmlText) return null;
+
+      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+
+      function isValidImgCandidate(u) {
+        if (!u || typeof u !== 'string') return false;
+        const t = u.trim();
+        if (!t || t.startsWith('javascript:') || t.startsWith('data:') || t.startsWith('#')) return false;
+        return true;
+      }
+
+      // 优先级 A（官方元数据）：检查 og:image 与 twitter:image
+      const ogMeta = doc.querySelector('meta[property="og:image:secure_url"]') ||
+                     doc.querySelector('meta[property="og:image"]') ||
+                     doc.querySelector('meta[name="twitter:image"]') ||
+                     doc.querySelector('meta[name="twitter:image:src"]');
+      if (ogMeta) {
+        const content = ogMeta.getAttribute('content');
+        if (isValidImgCandidate(content)) {
+          try {
+            return new URL(content.trim(), detailUrl).href;
+          } catch {}
+        }
+      }
+
+      // 优先级 B（下载直链）：检查页面中是否存在带有 download 属性的 <a>，或类名包含 download-btn、btn-download
+      const downloadSelectors = [
+        'a[download]',
+        'a.download-btn',
+        'a.btn-download',
+        'a.origin-image',
+        'a.view-full',
+        'a.full-size',
+        'a[href*="download"]',
+        'a[class*="download"]',
+        'a[id*="download"]'
+      ];
+      const downloadLinks = doc.querySelectorAll(downloadSelectors.join(','));
+      for (const a of downloadLinks) {
+        const rawHref = a.getAttribute('href');
+        if (isValidImgCandidate(rawHref)) {
+          try {
+            const abs = new URL(rawHref.trim(), detailUrl).href;
+            if (/\.(jpe?g|png|webp|avif|bmp)(?:[\?#]|$)/i.test(abs) || /\/(?:raw|original|large|download)\//i.test(abs)) {
+              return abs;
+            }
+          } catch {}
+        }
+      }
+
+      // 优先级 C（主画布启发式）：检索详情页中所有的 <img>，选取宽高最大或高画质特征图
+      const images = Array.from(doc.querySelectorAll('img'));
+      let bestCandidate = null;
+      let maxScore = -1;
+
+      const excludeRegex = /(avatar|logo|icon|ad-|advertisement|banner|related|recommend|comment|user|thumb|small)/i;
+      const highResRegex = /(raw|original|large|full|wallpaper|origin|master|hires)/i;
+
+      for (const img of images) {
+        const rawSrc = img.getAttribute('data-original') ||
+                       img.getAttribute('data-src') ||
+                       img.getAttribute('data-highres') ||
+                       img.getAttribute('src');
+
+        if (!isValidImgCandidate(rawSrc)) continue;
+
+        try {
+          const absSrc = new URL(rawSrc.trim(), detailUrl).href;
+          const className = `${img.className || ''} ${img.parentElement?.className || ''}`;
+          const id = `${img.id || ''} ${img.parentElement?.id || ''}`;
+          const alt = img.getAttribute('alt') || '';
+
+          if (excludeRegex.test(className) || excludeRegex.test(id) || excludeRegex.test(absSrc) || excludeRegex.test(alt)) {
+            continue;
+          }
+
+          const w = parseInt(img.getAttribute('width') || img.getAttribute('data-width') || '0', 10);
+          const h = parseInt(img.getAttribute('height') || img.getAttribute('data-height') || '0', 10);
+          let score = (w * h) || 1;
+
+          if (highResRegex.test(absSrc) || highResRegex.test(className) || highResRegex.test(id)) {
+            score += 10000000;
+          }
+
+          if (score > maxScore) {
+            maxScore = score;
+            bestCandidate = absSrc;
+          }
+        } catch {}
+      }
+
+      if (bestCandidate) {
+        return bestCandidate;
+      }
+
+      return null;
+    } catch (err) {
+      console.warn('[Deep Grab] 穿透解析详情页失败:', detailUrl, err.message);
+      return null;
+    }
+  }
+
+  function updateDeepGrabConsoleProgress(completed, total, phaseText) {
+    if (phaseText && dom.deepGrabPhaseText) dom.deepGrabPhaseText.textContent = phaseText;
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    if (dom.deepGrabProgressFill) dom.deepGrabProgressFill.style.width = `${percent}%`;
+  }
+
+  /**
+   * 启动受控并发穿透流程 (并发限制 2，微延迟 200ms)
+   */
+  async function startDeepGrab() {
+    if (state.isDeepGrabbing) return;
+
+    const candidates = state.allImages.filter(img => img.hasDetailLink && img.detailUrl && img.deepGrabStatus !== 'success');
+    if (candidates.length === 0) {
+      showAlert('当前画廊没有检测到可穿透的详情页，或者全部图片已穿透完成！');
+      return;
+    }
+
+    state.isDeepGrabbing = true;
+    state.deepGrabCancelRequested = false;
+    if (dom.btnDeepGrab) dom.btnDeepGrab.disabled = true;
+    if (dom.deepGrabConsole) {
+      dom.deepGrabConsole.classList.remove('hidden');
+    }
+
+    const total = candidates.length;
+    let finishedCount = 0;
+    let successCount = 0;
+    let fallbackCount = 0;
+
+    updateDeepGrabConsoleProgress(0, total, `正在穿透详情页: 0/${total}...`);
+
+    let currentIndex = 0;
+
+    async function deepWorker() {
+      while (currentIndex < candidates.length) {
+        if (state.deepGrabCancelRequested) break;
+        const myIdx = currentIndex++;
+        const item = candidates[myIdx];
+
+        item.deepGrabStatus = 'resolving';
+        updateCardDeepGrabUI(item);
+
+        updateDeepGrabConsoleProgress(
+          finishedCount,
+          total,
+          `正在穿透详情页 (${finishedCount + 1}/${total})...`
+        );
+
+        // 保护性微延迟 200ms
+        await new Promise(r => setTimeout(r, 200));
+        if (state.deepGrabCancelRequested) break;
+
+        const heroUrl = await resolveHeroImageFromDetail(item.detailUrl);
+
+        if (heroUrl && heroUrl !== item.url) {
+          const dims = await preloadImageDimensions(heroUrl);
+          const oldUrl = item.url;
+          item.originalPreviewUrl = oldUrl;
+          item.url = heroUrl;
+          if (dims.width > 0) item.width = dims.width;
+          if (dims.height > 0) item.height = dims.height;
+
+          item.is4K = Math.max(item.width, item.height) >= 2560;
+          item.deepGrabStatus = 'success';
+          successCount++;
+
+          updateCardWithResolvedHero(item, oldUrl);
+        } else {
+          item.deepGrabStatus = 'fallback';
+          fallbackCount++;
+          updateCardDeepGrabUI(item);
+        }
+
+        finishedCount++;
+        updateDeepGrabConsoleProgress(finishedCount, total);
+      }
+    }
+
+    const pool = [];
+    const workerCount = Math.min(MAX_DEEP_CONCURRENCY, candidates.length);
+    for (let i = 0; i < workerCount; i++) {
+      pool.push(deepWorker());
+    }
+
+    await Promise.all(pool);
+
+    state.isDeepGrabbing = false;
+    if (dom.btnDeepGrab) dom.btnDeepGrab.disabled = false;
+    if (dom.deepGrabConsole) {
+      dom.deepGrabConsole.classList.add('hidden');
+    }
+    updateDeepGrabButtonBadge();
+    updateSelectionSummary();
+
+    if (state.deepGrabCancelRequested) {
+      showAlert(`深度穿透已中止：已处理 ${finishedCount} 张，成功提取 ${successCount} 张高清原图。`);
+    } else {
+      showAlert(`🎉 深度穿透完成！成功提取 ${successCount} 张 4K/HD 原画大图，${fallbackCount} 张保持原预览。`);
+    }
   }
 
   // -------------------------------------------------------------
@@ -587,6 +934,19 @@
           this.dataset.fallbackAttempted = 'true';
           this.src = fallbackCandidate;
         }, { once: true });
+      }
+
+      // 深度穿透标签展示（若该图片有详情页支持穿透）
+      const deepBadgeHtml = renderDeepGrabBadge(img);
+      if (deepBadgeHtml) {
+        const thumbWrapper = card.querySelector('.card-thumb-wrapper');
+        if (thumbWrapper) {
+          const tempDiv = document.createElement('div');
+          tempDiv.innerHTML = deepBadgeHtml;
+          if (tempDiv.firstElementChild) {
+            thumbWrapper.appendChild(tempDiv.firstElementChild);
+          }
+        }
       }
 
       // 如果有下载状态覆盖层
@@ -1331,35 +1691,45 @@
     }
   }
 
+  let lightboxErrorHandler = null;
+
   function openLightbox(imgItem) {
     dom.lightboxImg.dataset.id = imgItem.id || '';
-    dom.lightboxImg.src = imgItem.url;
     dom.lightboxResolution.textContent = (imgItem.width && imgItem.height) ? `${imgItem.width} × ${imgItem.height}` : '未知尺寸';
     dom.lightboxFormat.textContent = detectImageFormat(imgItem);
     dom.lightboxUrl.textContent = imgItem.url;
 
-    // 修复 2：大图预览失败时通过 JS 事件绑定安全回退原始地址，杜绝内联 onerror 且防止死循环
+    // 清理旧的错误监听器
+    if (lightboxErrorHandler) {
+      dom.lightboxImg.removeEventListener('error', lightboxErrorHandler);
+      lightboxErrorHandler = null;
+    }
+
+    // 修复 2：大图预览失败时通过纯 JS 事件监听器安全回退原始地址，杜绝内联属性且防止死循环
     const fallbackCandidate = (imgItem.originalUrl && imgItem.originalUrl !== imgItem.url)
       ? imgItem.originalUrl
       : (imgItem.fallbackUrl && imgItem.fallbackUrl !== imgItem.url ? imgItem.fallbackUrl : null);
 
-    dom.lightboxImg.onerror = null;
     if (fallbackCandidate) {
-      dom.lightboxImg.onerror = function () {
-        dom.lightboxImg.onerror = null;
+      lightboxErrorHandler = function () {
         if (dom.lightboxImg.src !== fallbackCandidate) {
           dom.lightboxImg.src = fallbackCandidate;
           dom.lightboxUrl.textContent = fallbackCandidate;
         }
       };
+      dom.lightboxImg.addEventListener('error', lightboxErrorHandler, { once: true });
     }
 
+    dom.lightboxImg.src = imgItem.url;
     dom.modalLightbox.classList.remove('hidden');
   }
 
   function closeLightbox() {
     dom.modalLightbox.classList.add('hidden');
-    dom.lightboxImg.onerror = null;
+    if (lightboxErrorHandler) {
+      dom.lightboxImg.removeEventListener('error', lightboxErrorHandler);
+      lightboxErrorHandler = null;
+    }
     dom.lightboxImg.src = '';
     dom.lightboxImg.dataset.id = '';
   }
@@ -1452,6 +1822,17 @@
     // 核心下载
     dom.btnDownloadZip.addEventListener('click', startBatchDownload);
 
+    // 深度穿透 (Deep Grab)
+    if (dom.btnDeepGrab) {
+      dom.btnDeepGrab.addEventListener('click', startDeepGrab);
+    }
+    if (dom.btnCancelDeepGrab) {
+      dom.btnCancelDeepGrab.addEventListener('click', () => {
+        state.deepGrabCancelRequested = true;
+        if (dom.deepGrabPhaseText) dom.deepGrabPhaseText.textContent = '正在中止穿透...';
+      });
+    }
+
     // 取消下载
     dom.btnCancelDownload.addEventListener('click', () => {
       state.cancelRequested = true;
@@ -1507,9 +1888,13 @@
       }
     });
 
-    // ESC 快捷键关闭弹窗
+    // ESC 快捷键关闭弹窗 / 中止深度穿透
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
+        if (state.isDeepGrabbing) {
+          state.deepGrabCancelRequested = true;
+          if (dom.deepGrabPhaseText) dom.deepGrabPhaseText.textContent = '正在中止穿透...';
+        }
         if (!dom.modalLightbox.classList.contains('hidden')) closeLightbox();
         if (!dom.modalPro.classList.contains('hidden')) closeProModal();
       }
