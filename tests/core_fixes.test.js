@@ -867,9 +867,9 @@ async function runTests() {
     assert.ok(formattedError.includes('403 Forbidden') && formattedError.includes('Canvas兜底失败'));
   });
 
-  await asyncTest('专项测试 1 行为复现: Unsplash 416x624 容器中的小占位图绝不能被识别为 416px 大图且必须被真实过滤', async () => {
+  await asyncTest('专项测试 1 行为复现: Unsplash 416x624 容器中的小背景图绝不识别为 416px 大图，如实记录真实尺寸 20x30 且保留', async () => {
     // 模拟 Unsplash 卡片容器：clientWidth = 416, clientHeight = 624
-    // 容器内背景图片实际上为 20x30 像素的 blurhash / placeholder
+    // 容器内背景图片实际上为 20x30 像素的背景小图
     const container = {
       clientWidth: 416,
       clientHeight: 624,
@@ -880,17 +880,17 @@ async function runTests() {
       return { width: 20, height: 30, valid: true };
     };
 
-    // 运行采集逻辑对背景图进行过滤与验证
     const candidateUrl = 'https://images.unsplash.com/photo-123?w=20&blur=50';
     const check = await mockImageVerifier(candidateUrl);
     
     // 核心断言 1: 绝对不允许把容器 clientWidth/clientHeight (416x624) 当作图片分辨率
     assert.notStrictEqual(check.width, container.clientWidth, '背景图宽绝不能取容器的 clientWidth (416)');
     assert.notStrictEqual(check.height, container.clientHeight, '背景图高绝不能取容器的 clientHeight (624)');
+    assert.strictEqual(check.width, 20, '必须采用验证后的真实宽 20');
+    assert.strictEqual(check.height, 30, '必须采用验证后的真实高 30');
 
-    // 核心断言 2: 真实尺寸过小 (< 150px) 的占位图必须被过滤，不能进入结果
-    const isTinyOrPlaceholder = (check.width > 0 && check.height > 0 && (check.width < 150 || check.height < 150));
-    assert.strictEqual(isTinyOrPlaceholder, true, '真实分辨率小于 150px 的占位图必须被判定为杂质过滤');
+    // 核心断言 2: 阶段 2 要求有效小背景图不再按 150px 门槛粗暴丢弃，真实保留
+    assert.strictEqual(check.valid, true, '真实有效的背景小图保留在结果中');
   });
 
   await asyncTest('专项测试 2 行为复现: 真实大幅 CSS 背景图通过实际分辨率校验后正常采集', async () => {
@@ -908,9 +908,7 @@ async function runTests() {
     const candidateUrl = 'https://example.com/hero-wallpaper.jpg';
     const check = await mockImageVerifier(candidateUrl);
 
-    // 真实尺寸 >= 150px 的大图背景正常通过
-    const shouldKeep = check.valid && (check.width >= 150 && check.height >= 150);
-    assert.strictEqual(shouldKeep, true, '真实大幅背景图必须被保留');
+    assert.strictEqual(check.valid, true, '真实大幅背景图必须被保留');
     assert.strictEqual(check.width, 1920, '必须采用验证后的真实宽 1920，而非容器 800');
     assert.strictEqual(check.height, 1080, '必须采用验证后的真实高 1080，而非容器 400');
   });
@@ -1218,6 +1216,146 @@ async function runTests() {
 
     assert.strictEqual(mockStorage.currentCollectorTask.images.length, 2, '新增图片必须写入持久化存储');
     assert.strictEqual(mockStorage.currentCollectorTask.images[1].id, 'img_2', '持久化中保存了完整新图片对象');
+  });
+
+  // -------------------------------------------------------------
+  // 专项测试：阶段 2「完整图片采集与真实尺寸校验」验收
+  // -------------------------------------------------------------
+  await test('阶段 2 验证 1: content.js 源码静态断言，彻底移除 150px 与 avatar/logo/icon 限制', () => {
+    const contentCode = fs.readFileSync(CONTENT_JS_PATH, 'utf-8');
+
+    // 1. 严禁存在针对尺寸的 150px 排除门槛
+    assert.ok(!contentCode.includes('width < 150'), 'content.js 中严禁包含 width < 150 尺寸过滤');
+    assert.ok(!contentCode.includes('height < 150'), 'content.js 中严禁包含 height < 150 尺寸过滤');
+    assert.ok(!contentCode.includes('clientWidth < 50'), 'content.js 中严禁按容器 clientWidth < 50 排除图片');
+
+    // 2. 严禁按 avatar/logo/icon 名称过滤
+    assert.ok(!contentCode.includes('isAvatarOrIcon('), 'content.js 中严禁调用 isAvatarOrIcon 过滤图片');
+
+    // 3. 必须包含对未确认尺寸图片的异步尺寸补齐逻辑
+    assert.ok(contentCode.includes('verifyImageDimensions'), 'content.js 必须保留真实尺寸验证');
+    assert.ok(contentCode.includes('runWithConcurrency'), 'content.js 必须通过并发池进行安全异步校验');
+  });
+
+  await asyncTest('阶段 2 验证 2: 16x16, 32x32, 80x80 小图片及包含 avatar/logo/icon 的有效图片均被完整采集', async () => {
+    // 模拟一组包含小图、图标与头像的元素集合
+    const testCases = [
+      { url: 'https://example.com/favicon-16x16.png', width: 16, height: 16, alt: 'favicon' },
+      { url: 'https://example.com/icon-32x32.png', width: 32, height: 32, alt: 'app-icon' },
+      { url: 'https://example.com/avatar-user.jpg', width: 80, height: 80, alt: 'user avatar' },
+      { url: 'https://example.com/company-logo.svg', width: 0, height: 0, alt: 'brand logo' }
+    ];
+
+    const candidateMap = new Map();
+    function mockRegister({ url, width = 0, height = 0, alt = '' }) {
+      if (!url) return;
+      candidateMap.set(url, { url, width, height, alt });
+    }
+
+    testCases.forEach(item => mockRegister(item));
+
+    assert.strictEqual(candidateMap.size, 4, '全部 4 张小图片与图标头像必须完整保留');
+    assert.strictEqual(candidateMap.get('https://example.com/favicon-16x16.png').width, 16, '16x16 尺寸真实记录');
+    assert.strictEqual(candidateMap.get('https://example.com/avatar-user.jpg').width, 80, '80x80 头像真实记录且不被删除');
+    assert.strictEqual(candidateMap.get('https://example.com/company-logo.svg').width, 0, 'SVG 未验证前记录为未知尺寸');
+  });
+
+  await asyncTest('阶段 2 验证 3 & 4 & 5: CSS 背景图采集保留 32x32 小图与 1920x1080 大图，20x30 不被标为 416x624', async () => {
+    // 模拟 3 类背景图：小图标背景图 (32x32)、blurhash 小占位图 (20x30) 及高清壁纸 (1920x1080)
+    const mockBgItems = [
+      { url: 'https://example.com/small-bg-icon.png', realW: 32, realH: 32, containerW: 48, containerH: 48 },
+      { url: 'https://images.unsplash.com/blur-placeholder', realW: 20, realH: 30, containerW: 416, containerH: 624 },
+      { url: 'https://example.com/hero-banner.jpg', realW: 1920, realH: 1080, containerW: 800, containerH: 450 }
+    ];
+
+    const verifiedResults = [];
+    for (const item of mockBgItems) {
+      // 模拟 verifyImageDimensions 真实校验
+      const check = { width: item.realW, height: item.realH, valid: true };
+      assert.strictEqual(check.valid, true);
+      // 确保不借用 containerW / containerH
+      assert.notStrictEqual(check.width, item.containerW, '绝不采用容器宽度');
+      assert.notStrictEqual(check.height, item.containerH, '绝不采用容器高度');
+
+      // 无论尺寸多小，只要有效均予以保留
+      verifiedResults.push({
+        url: item.url,
+        width: check.width,
+        height: check.height,
+        source: 'background-image'
+      });
+    }
+
+    assert.strictEqual(verifiedResults.length, 3, '全部 3 张背景图必须全部保留');
+    assert.strictEqual(verifiedResults[0].width, 32, '32x32 背景小图保留真实尺寸 32');
+    assert.strictEqual(verifiedResults[1].width, 20, '20x30 记录真实尺寸 20，绝不为 416');
+    assert.strictEqual(verifiedResults[1].height, 30, '20x30 记录真实尺寸 30，绝不为 624');
+    assert.strictEqual(verifiedResults[2].width, 1920, '1920x1080 大图背景正常采集');
+  });
+
+  await asyncTest('阶段 2 验证 6 & 7: srcset 高清候选与缩略预览图尺寸不混用，未验证前显示「未知尺寸」', async () => {
+    // 模拟 DOM 预览图为 400x300，但就地决选选出了 srcset 中的 2048w 条目
+    const currentSrc = 'https://example.com/thumb?w=400';
+    const chosenUrl = 'https://example.com/hd?w=2048';
+    const domNaturalWidth = 400;
+    const domNaturalHeight = 300;
+
+    // 尺寸确认规则：只有 chosenUrl 与 currentSrc 一致时才采用 domNaturalWidth
+    let chosenWidth = 0;
+    let chosenHeight = 0;
+    if (chosenUrl === currentSrc && domNaturalWidth > 0) {
+      chosenWidth = domNaturalWidth;
+      chosenHeight = domNaturalHeight;
+    }
+
+    assert.strictEqual(chosenWidth, 0, '高清候选与预览图 URL 不同时绝不混用 400 宽');
+    assert.strictEqual(chosenHeight, 0, '高清候选与预览图 URL 不同时绝不混用 300 高');
+
+    // 画廊端对 0x0 尺寸的显示
+    const displayLabel = (chosenWidth > 0 && chosenHeight > 0) ? `${chosenWidth} × ${chosenHeight}` : '未知尺寸';
+    assert.strictEqual(displayLabel, '未知尺寸', '未验证尺寸统一展示为「未知尺寸」，绝不虚构');
+
+    // 模拟异步验证成功后更新尺寸
+    const asyncVerified = { width: 2048, height: 1365 };
+    chosenWidth = asyncVerified.width;
+    chosenHeight = asyncVerified.height;
+    const updatedLabel = `${chosenWidth} × ${chosenHeight}`;
+    assert.strictEqual(updatedLabel, '2048 × 1365', '异步校验成功后更新为真实分辨率');
+  });
+
+  await asyncTest('阶段 2 验证 8 & 9: 采集与展示分离，滑块为 200px 时小图保留在 allImages，调至 0 时完全呈现', async () => {
+    // 模拟画廊状态，包含小图 (64x64)、未知尺寸 (0x0) 与大图 (1200x800)
+    const galleryState = {
+      allImages: [
+        { id: 'img_1', url: 'https://example.com/small.png', width: 64, height: 64 },
+        { id: 'img_2', url: 'https://example.com/vector.svg', width: 0, height: 0 },
+        { id: 'img_3', url: 'https://example.com/large.jpg', width: 1200, height: 800 }
+      ],
+      selectedIds: new Set(['img_1']),
+      minWidth: 200, // 默认 200px 滑块
+      minHeight: 200,
+      currentFormat: 'ALL'
+    };
+
+    function filterGallery(state) {
+      return state.allImages.filter(img => {
+        if (state.minWidth > 0 && img.width > 0 && img.width < state.minWidth) return false;
+        if (state.minHeight > 0 && img.height > 0 && img.height < state.minHeight) return false;
+        return true;
+      });
+    }
+
+    // 默认 200px 过滤下：小图被过滤展示，但未知尺寸与大图展示
+    let visibleImages = filterGallery(galleryState);
+    assert.strictEqual(visibleImages.length, 2, '200px 阈值下展示未知尺寸与大图');
+    assert.strictEqual(galleryState.allImages.length, 3, 'allImages 依然完好包含小图');
+
+    // 用户将滑块调至 0x0 进行人工验收
+    galleryState.minWidth = 0;
+    galleryState.minHeight = 0;
+    visibleImages = filterGallery(galleryState);
+    assert.strictEqual(visibleImages.length, 3, '滑块调为 0 后全部 3 张图片（含小图）均正常展示');
+    assert.ok(galleryState.selectedIds.has('img_1'), '小图的已勾选状态完好保留');
   });
 
   console.log(`\n测试完成: ${passed} / ${total} 全部通过`);

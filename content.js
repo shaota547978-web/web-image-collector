@@ -31,20 +31,17 @@
   }
 
   /**
-   * 检测 DOM 元素的可见性（严格过滤隐藏图片）
+   * 检测 DOM 元素的可见性（严格过滤隐藏图片，但保留视口外有明确图片地址的懒加载节点）
    */
   function isElementVisible(el) {
     if (!el) return false;
 
-    // 1. 检查 offset 尺寸
-    if (el.offsetWidth === 0 || el.offsetHeight === 0) {
-      const rect = el.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) {
-        return false;
-      }
+    // 1. 检查 HTML 隐藏属性
+    if (el.hasAttribute && el.hasAttribute('hidden')) {
+      return false;
     }
 
-    // 2. 检查 CSS 计算样式
+    // 2. 检查 CSS 计算样式：明确声明不可见的直接过滤
     try {
       const style = window.getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
@@ -54,61 +51,40 @@
       // 样式获取异常
     }
 
-    // 3. 检查 HTML 隐藏属性
-    if (el.hasAttribute('hidden')) {
-      return false;
+    // 3. 检查尺寸：如果 offset 尺寸与 getBoundingClientRect 均为 0，
+    // 但拥有明确有效的图片 URL 属性（懒加载节点尚未进入视口渲染），不予排除
+    if (el.offsetWidth === 0 || el.offsetHeight === 0) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        const hasLazyImageAttr = el.hasAttribute && (
+          el.hasAttribute('src') ||
+          el.hasAttribute('data-src') ||
+          el.hasAttribute('data-original') ||
+          el.hasAttribute('data-srcset') ||
+          el.hasAttribute('srcset') ||
+          el.hasAttribute('data-highres')
+        );
+        if (!hasLazyImageAttr) {
+          return false;
+        }
+      }
     }
 
     return true;
   }
 
   /**
-   * 检查元素是否为头像、作者照片、Logo 或小图标等杂质
+   * 检查是否为明确的空或微型追踪像素 data URL (绝不按分辨率排除普通小图片)
    */
-  function isAvatarOrIcon(el) {
-    if (!el) return false;
-    const keywords = ['avatar', 'profile', 'author', 'logo', 'icon', 'badge', 'user-pic', 'userpic', 'user-avatar'];
-
-    let current = el;
-    let depth = 0;
-    while (current && depth < 4) {
-      const className = (typeof current.className === 'string' ? current.className : '').toLowerCase();
-      const id = (current.id || '').toLowerCase();
-      const role = (current.getAttribute && current.getAttribute('role') || '').toLowerCase();
-
-      for (const kw of keywords) {
-        if (className.includes(kw) || id.includes(kw)) {
-          return true;
-        }
-      }
-
-      if (role === 'img' && (className.includes('icon') || className.includes('logo'))) {
-        return true;
-      }
-
-      current = current.parentElement;
-      depth++;
-    }
-    return false;
-  }
-
-  /**
-   * 检查是否为微型追踪像素或极小占位符
-   */
-  function isPixelOrTinyDataUrl(url, width, height) {
+  function isPixelOrTinyDataUrl(url) {
     if (!url) return true;
 
-    // 150px 门槛检测：如果已知尺寸均小于 150px，剔除
-    if (width > 0 && height > 0 && (width < 150 || height < 150)) {
-      return true;
-    }
-
-    // 检查常见的 1x1 透明 gif/png 追踪像素 base64
+    // 仅针对 data URL 检查典型的 1x1 透明 gif/png 追踪像素 base64
     if (url.startsWith('data:')) {
       if (url.includes('R0lGODlhAQABA') || url.includes('iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB')) {
         return true;
       }
-      if (url.length < 200) {
+      if (url.length < 40) {
         return true;
       }
     }
@@ -296,7 +272,7 @@
   }
 
   /**
-   * 页面图片采集主入口 (异步扫描并验证背景图真实尺寸)
+   * 页面图片采集主入口 (完整采集所有有效图片，真实校验图片尺寸)
    */
   async function collectImagesFromPage() {
     // 跨节点的去重逻辑：安全基准，仅当【完整 URL 字符串完全相同】时执行去重
@@ -306,8 +282,8 @@
       const absUrl = normalizeUrl(url);
       if (!absUrl) return;
 
-      // 提升门槛：若已知分辨率均小于 150px，剔除
-      if (isPixelOrTinyDataUrl(absUrl, width, height)) {
+      // 仅过滤微型 1x1 追踪 data URL，绝不因为尺寸小而丢弃有效图片
+      if (isPixelOrTinyDataUrl(absUrl)) {
         return;
       }
 
@@ -319,8 +295,8 @@
       // 安全基准去重：仅当完整 URL 字符串完全相同时去重
       if (candidateMap.has(targetUrl)) {
         const existing = candidateMap.get(targetUrl);
-        existing.width = Math.max(existing.width || 0, width || 0);
-        existing.height = Math.max(existing.height || 0, height || 0);
+        if (width > 0) existing.width = Math.max(existing.width || 0, width);
+        if (height > 0) existing.height = Math.max(existing.height || 0, height);
         if (!existing.alt && alt) existing.alt = alt;
         if (!existing.detailUrl && detailUrl) {
           existing.detailUrl = detailUrl;
@@ -344,38 +320,19 @@
       }
     }
 
-    // 1. 深度扫描页面所有 <img> 标签
+    // 1. 深度扫描页面所有 <img> 标签（不排除头像、Logo、小图标与小图片）
     const imgElements = document.querySelectorAll('img');
     imgElements.forEach(img => {
-      // 1.1 可见性检测：过滤不可见元素
+      // 1.1 可见性检测：仅过滤显式隐藏元素
       if (!isElementVisible(img)) {
         return;
       }
 
-      // 1.2 过滤头像与小杂质
-      if (isAvatarOrIcon(img)) {
-        return;
-      }
-
-      // 1.3 尺寸检测：过滤真实分辨率 < 150px 杂质或微型图标容器
-      const naturalWidth = img.naturalWidth || 0;
-      const naturalHeight = img.naturalHeight || 0;
-      const clientWidth = img.clientWidth || img.offsetWidth || 0;
-      const clientHeight = img.clientHeight || img.offsetHeight || 0;
-
-      // 如果已具备真实渲染分辨率且尺寸均 < 150px，剔除
-      if (naturalWidth > 0 && naturalHeight > 0) {
-        if (naturalWidth < 150 || naturalHeight < 150) return;
-      } else if (clientWidth > 0 && clientHeight > 0) {
-        // 容器小于 50px 显然是图标、按钮等杂质
-        if (clientWidth < 50 || clientHeight < 50) return;
-      }
-
-      // 1.4 顺藤摸瓜探测：识别外层包裹的 <a> 链接与本地大图属性
+      // 1.2 顺藤摸瓜探测：识别外层包裹的 <a> 链接与本地大图属性
       const { directImageUrl, detailUrl } = extractAnchorInfo(img);
       const localHighRes = extractLocalHighResAttribute(img);
 
-      // 1.5 【DOM 节点就地决选】
+      // 1.3 【DOM 节点就地决选】
       const rawSrcset = img.getAttribute('srcset');
       const bestSrcset = extractBestFromSrcset(rawSrcset);
 
@@ -422,7 +379,9 @@
       }
 
       // 严格尺寸确认：只有当 chosenUrl 确实是当前 img 已经在 DOM 中加载且具有 naturalWidth/naturalHeight 时，才是真实已验证分辨率
-      // 绝不把容器 clientWidth/clientHeight 或 srcset 描述符当成已验证尺寸！未验证时设为 0（画廊显示「未知尺寸」，不编造）
+      // 绝不把容器 clientWidth/clientHeight 或 srcset 描述符当成已验证尺寸！两者不一致时设为 0，等待异步校验或标注为未知尺寸
+      const naturalWidth = img.naturalWidth || 0;
+      const naturalHeight = img.naturalHeight || 0;
       if (chosenUrl && primaryUrl && (chosenUrl === primaryUrl || chosenUrl === img.src)) {
         if (naturalWidth > 0 && naturalHeight > 0) {
           chosenWidth = naturalWidth;
@@ -430,7 +389,7 @@
         }
       }
 
-      // 单个 <img> 仅录入就地胜出的唯一最高清 URL，附带 primaryUrl 作为降级原图
+      // 单个 <img> 录入就地胜出的最高清候选 URL，保留全部有效小图与大图
       if (chosenUrl) {
         registerCandidate({
           url: chosenUrl,
@@ -450,9 +409,7 @@
     pictureSources.forEach(source => {
       const parentPic = source.closest('picture');
       if (parentPic && !isElementVisible(parentPic)) return;
-      if (parentPic && isAvatarOrIcon(parentPic)) return;
 
-      // 若父级 picture 已经包含 img，img 处理逻辑已就地提取 srcset
       if (parentPic && parentPic.querySelector('img')) {
         return;
       }
@@ -472,26 +429,23 @@
     const videoElements = document.querySelectorAll('video[poster]');
     videoElements.forEach(video => {
       if (!isElementVisible(video)) return;
-      if (isAvatarOrIcon(video)) return;
 
       const poster = video.getAttribute('poster');
       if (poster) {
         const w = video.videoWidth || 0;
         const h = video.videoHeight || 0;
-        if ((w === 0 || w >= 150) && (h === 0 || h >= 150)) {
-          registerCandidate({
-            url: poster,
-            width: w,
-            height: h,
-            source: 'video-poster'
-          });
-        }
+        registerCandidate({
+          url: poster,
+          width: w,
+          height: h,
+          source: 'video-poster'
+        });
       }
     });
 
     // 4. 扫描 CSS background-image
     // 关键修复：绝不再把容器 clientWidth/clientHeight 当作背景图片真实分辨率
-    // 对背景图 URL 执行真实图片宽高验证，剔除过小占位图/追踪像素，同时保留真正的大图背景
+    // 对背景图 URL 执行真实图片宽高验证，保留有效小图片（如 32x32）与大幅背景图（如 1920x1080）
     const candidateBgUrls = new Set();
     const bgElements = document.querySelectorAll(
       '[style*="background"], header, banner, hero, .banner, .hero, .bg, .slider, .carousel, div, section, article'
@@ -501,14 +455,6 @@
     bgElements.forEach(el => {
       try {
         if (!isElementVisible(el)) return;
-        if (isAvatarOrIcon(el)) return;
-
-        // 容器自身如果小于 50px，通常是小图标或装饰条，提前跳过
-        const cw = el.clientWidth || el.offsetWidth || 0;
-        const ch = el.clientHeight || el.offsetHeight || 0;
-        if (cw > 0 && ch > 0 && (cw < 50 || ch < 50)) {
-          return;
-        }
 
         const inlineBg = el.style && el.style.backgroundImage;
         let bgStyle = inlineBg;
@@ -526,7 +472,7 @@
             const rawUrl = match[1].trim();
             const absUrl = normalizeUrl(rawUrl);
             if (absUrl && !candidateMap.has(absUrl)) {
-              if (!isPixelOrTinyDataUrl(absUrl, 0, 0)) {
+              if (!isPixelOrTinyDataUrl(absUrl)) {
                 candidateBgUrls.add(absUrl);
               }
             }
@@ -537,33 +483,19 @@
       }
     });
 
-    // 对收集到的候选背景图片 URL 执行受限并发与超时校验
+    // 4.1 对收集到的候选背景图片 URL 执行真实尺寸校验（允许小尺寸背景图进入，记录真实尺寸）
     if (candidateBgUrls.size > 0) {
       const bgUrlList = Array.from(candidateBgUrls);
-      await runWithConcurrency(bgUrlList, 5, async (bgUrl) => {
+      await runWithConcurrency(bgUrlList, 6, async (bgUrl) => {
         const check = await verifyImageDimensions(bgUrl, 2000);
         if (check.valid) {
-          if (check.width > 0 && check.height > 0) {
-            // 真实尺寸过小的占位图、模糊缩略图、图标 (< 150px) 过滤剔除
-            if (check.width < 150 || check.height < 150) {
-              return;
-            }
-            // 真正的大幅背景图保留，并记录真实分辨率
-            registerCandidate({
-              url: bgUrl,
-              width: check.width,
-              height: check.height,
-              source: 'background-image'
-            });
-          } else {
-            // 尺寸无法确定时（如 SVG），显示「未知尺寸」，不编造宽高
-            registerCandidate({
-              url: bgUrl,
-              width: 0,
-              height: 0,
-              source: 'background-image'
-            });
-          }
+          // 记录真实分辨率，不编造父容器尺寸，也不丢弃小尺寸有效背景图
+          registerCandidate({
+            url: bgUrl,
+            width: check.width || 0,
+            height: check.height || 0,
+            source: 'background-image'
+          });
         } else if (check.timeout) {
           // 验证超时但为有效网络图片：保留但设为未知尺寸，不编造
           if (bgUrl.startsWith('http://') || bgUrl.startsWith('https://')) {
@@ -575,24 +507,44 @@
             });
           }
         }
-        // 若 check.valid 为 false 且非超时，则是 404/无效图片，直接剔除
       });
     }
 
-    // 输出清洗后的图片列表（包含原始地址与降级元数据）
+    // 5. 对所有未确认尺寸的候选网络图片（如 srcset 高清候选、未加载懒加载大图）进行受控异步验证并更新真实尺寸
+    const unverifiedCandidates = Array.from(candidateMap.values()).filter(
+      item => (item.width === 0 || item.height === 0) &&
+              item.source !== 'background-image' &&
+              (item.url.startsWith('http://') || item.url.startsWith('https://'))
+    );
+
+    if (unverifiedCandidates.length > 0) {
+      await runWithConcurrency(unverifiedCandidates, 8, async (item) => {
+        try {
+          const check = await verifyImageDimensions(item.url, 1500);
+          if (check.valid && check.width > 0 && check.height > 0) {
+            item.width = check.width;
+            item.height = check.height;
+          }
+        } catch {
+          // 校验失败保留原有 0 宽高，由画廊显示「未知尺寸」
+        }
+      });
+    }
+
+    // 6. 输出清洗后的图片列表（包含原始地址与降级元数据，不过滤小图片）
     const finalResults = Array.from(candidateMap.values()).map(item => ({
       url: item.url,
       originalUrl: item.originalUrl || item.url,
       fallbackUrl: item.fallbackUrl || null,
-      width: item.width,
-      height: item.height,
+      width: item.width || 0,
+      height: item.height || 0,
       alt: item.alt,
       source: item.source,
       detailUrl: item.detailUrl || null,
       hasDetailLink: !!item.detailUrl
     })).filter(item => {
       if (!item.url) return false;
-      if (item.url.startsWith('data:')) return item.url.length >= 200;
+      if (item.url.startsWith('data:')) return !isPixelOrTinyDataUrl(item.url);
       return item.url.startsWith('http://') || item.url.startsWith('https://');
     });
 
