@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Image Collector - Batch Download & ZIP</title>
+  <link rel="stylesheet" href="gallery.css">
+</head>
+<body class="dark-theme">
+  <!-- 顶部主导航 -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="brand">
+        <div class="logo-box">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="4" ry="4"></rect>
+            <circle cx="8.5" cy="8.5" r="1.5"></circle>
+            <polyline points="21 15 16 10 5 21"></polyline>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <span class="title">Web Image Collector</span>
+          <span class="version-tag">MVP V3</span>
+        </div>
+      </div>
+
+      <!-- 来源网页胶囊 -->
+      <div class="source-capsule" id="sourceCapsule" title="点击可访问采集来源页面">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+        </svg>
+        <span class="source-title" id="sourceTitle">正在加载抓取来源...</span>
+        <a href="#" target="_blank" id="sourceLink" class="source-link" title="在新标签页中打开原网页">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </a>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <!-- 商业层 Pro 状态/激活入口 -->
+      <div class="license-wrapper">
+        <button id="btnProModal" class="btn-pro-badge free-state">
+          <span class="pro-icon">💎</span>
+          <span class="pro-text" id="proBtnText">Upgrade Pro</span>
+        </button>
+      </div>
+
+      <!-- 深度穿透 (Deep Grab) 操作按钮 -->
+      <button id="btnDeepGrab" class="btn-deep-grab hidden" title="从详情页智能穿透提取 4K/HD 真实主角大图">
+        <span class="deep-icon">⚡</span>
+        <span class="deep-text" id="deepGrabText">深度穿透 (Deep Grab)</span>
+        <span class="deep-badge" id="deepGrabBadge">0</span>
+      </button>
+
+      <!-- 核心下载按钮 -->
+      <button id="btnDownloadZip" class="btn-primary-action">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" y1="15" x2="12" y2="3"></line>
+        </svg>
+        <span class="btn-text">Download ZIP</span>
+        <span class="badge-count" id="downloadBadge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- 次级过滤与控制面板 -->
+  <section class="toolbar-section">
+    <!-- 快捷过滤滑块 -->
+    <div class="filter-group">
+      <div class="slider-control">
+        <label for="sliderMinWidth">
+          <span>最小宽度</span>
+          <span class="slider-val" id="valMinWidth">200 px</span>
+        </label>
+        <input type="range" id="sliderMinWidth" min="0" max="2000" step="50" value="200">
+      </div>
+
+      <div class="slider-control">
+        <label for="sliderMinHeight">
+          <span>最小高度</span>
+          <span class="slider-val" id="valMinHeight">200 px</span>
+        </label>
+        <input type="range" id="sliderMinHeight" min="0" max="2000" step="50" value="200">
+      </div>
+
+      <!-- 图片格式过滤 -->
+      <div class="format-chips" id="formatChips">
+        <button class="chip active" data-format="ALL">全部格式</button>
+        <button class="chip" data-format="JPG">JPG/JPEG</button>
+        <button class="chip" data-format="PNG">PNG</button>
+        <button class="chip" data-format="WEBP">WEBP</button>
+        <button class="chip" data-format="SVG">SVG</button>
+      </div>
+    </div>
+
+    <!-- 批量快捷勾选与统计 -->
+    <div class="action-group">
+      <div class="quick-select-btns">
+        <button id="btnSelectAll" class="btn-secondary" title="全选当前可见图片">全选</button>
+        <button id="btnInvertSelect" class="btn-secondary" title="反向勾选可见图片">反选</button>
+        <button id="btnSelectLarge" class="btn-secondary" title="仅勾选宽度或高度 > 800px 的高清大图">仅选大图</button>
+        <button id="btnClearSelect" class="btn-secondary" title="取消所有勾选">清空</button>
+      </div>
+
+      <!-- 选中统计看板 -->
+      <div class="selection-summary">
+        <span class="stat-item">
+          已勾选：<strong id="statSelectedCount">0</strong> / <span id="statVisibleCount">0</span> 张
+        </span>
+        <span class="stat-divider">|</span>
+        <span class="stat-item">
+          预估容量：<strong id="statEstimatedSize">0 MB</strong>
+        </span>
+        <span class="quota-warning-pill" id="freeLimitNotice" title="免费版单次最多勾选 20 张">
+          免费版上限 20 张
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 网页嗅探通知/告警横幅 (若有) -->
+  <div id="alertBanner" class="alert-banner hidden">
+    <div class="alert-content">
+      <span class="alert-icon">⚠️</span>
+      <span class="alert-text" id="alertBannerText"></span>
+    </div>
+    <button class="alert-close" id="btnAlertClose">&times;</button>
+  </div>
+
+  <!-- 主体画廊容器 -->
+  <main class="gallery-container">
+    <!-- 空数据占位图 -->
+    <div id="emptyState" class="empty-state hidden">
+      <div class="empty-icon">🖼️</div>
+      <h3>暂无符合条件的图片</h3>
+      <p id="emptySubtext">请尝试降低滑块过滤阈值，或者切换至包含丰富图片的网页再次抓取。</p>
+    </div>
+
+    <!-- 图片卡片网格 -->
+    <div class="gallery-grid" id="galleryGrid">
+      <!-- 动态插入图片卡片 -->
+    </div>
+  </main>
+
+  <!-- 底部固定浮动状态与进度控制台 (下载时升起) -->
+  <div id="bottomConsole" class="bottom-console hidden">
+    <div class="console-main">
+      <div class="console-status-line">
+        <div class="status-left">
+          <div class="spinner-dot" id="consoleSpinner"></div>
+          <span class="status-phase-text" id="consolePhaseText">准备下载...</span>
+          <span class="status-detail-text" id="consoleDetailText">并发下载池限制: 3 | 内存安全保护启用</span>
+        </div>
+        <div class="status-right">
+          <span class="status-stat" id="consoleProgressCounter">0 / 0</span>
+          <button id="btnCancelDownload" class="btn-ghost-sm">取消</button>
+        </div>
+      </div>
+
+      <!-- 动态进度条 -->
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progressBarFill" style="width: 0%;"></div>
+      </div>
+
+      <!-- 异常报告抽屉 (若有下载失败的图片) -->
+      <div class="error-summary-bar hidden" id="errorSummaryBar">
+        <div class="error-summary-header" id="btnToggleErrorDrawer">
+          <span class="error-badge" id="errorBadgeCount">0 张图片下载失败</span>
+          <span class="error-tip">多因跨域 CORS 或防盗链拦截，已自动跳过，不影响其余图片打包</span>
+          <span class="toggle-icon" id="errorDrawerIcon">▼</span>
+        </div>
+        <div class="error-details-list hidden" id="errorDetailsList">
+          <!-- 动态插入失败链接 -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 1：Pro 会员升级 / 激活 -->
+  <div id="modalPro" class="modal-backdrop hidden">
+    <div class="modal-card pro-card">
+      <button class="modal-close" id="btnCloseProModal">&times;</button>
+      
+      <div class="pro-modal-header">
+        <div class="pro-sparkle-badge">PRO UPGRADE</div>
+        <h2>解锁 Web Image Collector Pro</h2>
+        <p class="subtitle">单次免费下载上限为 20 张。升级 Pro 即可享受无限批量导出与全速并发。</p>
+      </div>
+
+      <div class="pro-features-grid">
+        <div class="feature-item">
+          <span class="feature-icon">⚡</span>
+          <div>
+            <strong>无限制勾选与导出</strong>
+            <p>单次突破 20 张配额，一键打包上千张高清大图</p>
+          </div>
+        </div>
+        <div class="feature-item">
+          <span class="feature-icon">🚀</span>
+          <div>
+            <strong>高速下载与大内存包</strong>
+            <p>优化的多并发网络池，支持高达 500MB 超大打包</p>
+          </div>
+        </div>
+        <div class="feature-item">
+          <span class="feature-icon">🛡️</span>
+          <div>
+            <strong>智能智能格式还原</strong>
+            <p>自动识别 WebP/AVIF 并无损命名归档</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 激活输入框 -->
+      <div class="license-form">
+        <label for="inputLicenseKey">输入 Pro 激活授权码：</label>
+        <div class="input-with-button">
+          <input type="text" id="inputLicenseKey" placeholder="例如: MOCK-PRO-2026" autocomplete="off" spellcheck="false">
+          <button id="btnActivateLicense" class="btn-activate">立即激活</button>
+        </div>
+        <p class="license-hint">
+          💡 <strong>验收测试提示：</strong> 输入测试码 <code>MOCK-PRO-2026</code> 即可直接免费激活 Pro 状态用于功能验收。
+        </p>
+      </div>
+
+      <div class="modal-pro-footer">
+        <span class="license-status-display" id="licenseStatusDisplay">当前状态：免费版</span>
+        <button id="btnResetProTrial" class="btn-text-only" title="清除本地 Pro 状态，还原为免费版以验证 20 张拦截">
+          重置为免费版 (用于测试)
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 2：150MB 内存安全保护警告 -->
+  <div id="modalQuotaGuard" class="modal-backdrop hidden">
+    <div class="modal-card quota-card">
+      <div class="quota-warning-icon">⚠️</div>
+      <h2>单包体积保护上限警告</h2>
+      <p class="quota-description">
+        当前已下载图片体积已达到 <strong id="currentDownloadedSizeText">150 MB</strong>。<br>
+        根据 Chrome 扩展内存保护机制，为了避免浏览器标签页发生 OOM 内存崩溃或页面假死，建议立即完成当前分批打包。
+      </p>
+
+      <div class="quota-modal-actions">
+        <button id="btnQuotaStopAndZip" class="btn-primary-action">
+          📦 停止后续下载，仅打包当前已完成图片
+        </button>
+        <button id="btnQuotaContinue" class="btn-secondary">
+          继续下载剩余图片（内存占用较高）
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 3：Lightbox 高清大图预览 -->
+  <div id="modalLightbox" class="lightbox-backdrop hidden">
+    <button class="lightbox-close" id="btnCloseLightbox" title="关闭预览 (ESC)">&times;</button>
+    <div class="lightbox-content">
+      <img id="lightboxImg" src="" alt="Preview">
+    </div>
+    <div class="lightbox-footer">
+      <div class="lightbox-info">
+        <span id="lightboxResolution" class="badge">-- × --</span>
+        <span id="lightboxFormat" class="badge">--</span>
+        <span id="lightboxUrl" class="url-text">--</span>
+      </div>
+      <div class="lightbox-actions">
+        <button id="btnCopyImageUrl" class="btn-secondary">复制图片地址</button>
+        <button id="btnDownloadSingleImg" class="btn-primary-action">单张下载</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 浮动轻量穿透进度面板 -->
+  <div id="deepGrabConsole" class="deep-grab-console hidden">
+    <div class="deep-console-inner">
+      <div class="deep-spinner"></div>
+      <div class="deep-info-block">
+        <span class="deep-title" id="deepGrabPhaseText">正在穿透详情页: 0/0...</span>
+        <span class="deep-desc">并发限制: 2 | 200ms 防风控延迟 | 按 Esc 随时中止</span>
+      </div>
+      <div class="deep-progress-wrapper">
+        <div class="deep-progress-fill" id="deepGrabProgressFill" style="width: 0%;"></div>
+      </div>
+      <button id="btnCancelDeepGrab" class="btn-ghost-sm" title="中止当前穿透">中止</button>
+    </div>
+  </div>
+
+  <!-- 本地打包依赖：纯本地 JSZip 库 -->
+  <script src="libs/jszip.min.js"></script>
+  <!-- 业务逻辑脚本 -->
+  <script src="gallery.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Web Image Collector - Batch Download & ZIP",
+  "version": "1.0.0",
+  "description": "一键批量嗅探网页图片、智能尺寸过滤与高保真 ZIP 打包下载工具 (Manifest V3)",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "*://*/*"
+  ],
+  "action": {
+    "default_title": "采集当前网页图片",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "gallery.html",
+        "gallery.css",
+        "gallery.js",
+        "libs/jszip.min.js",
+        "icons/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
