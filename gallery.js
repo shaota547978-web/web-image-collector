@@ -10,9 +10,9 @@
   // 1. 全局状态
   // -------------------------------------------------------------
   const state = {
-    allImages: [],           // 嗅探到的所有图片列表 [{ url, width, height, alt, source }]
+    allImages: [],           // 嗅探到的所有图片列表 [{ id, url, originalUrl, fallbackUrl, width, height, alt, source }]
     filteredImages: [],      // 当前符合滑块与格式条件的图片列表
-    selectedUrls: new Set(), // 当前已勾选的图片 URL
+    selectedIds: new Set(),  // 当前已勾选的图片 ID (统一身份管理，杜绝与下载 URL 混用)
     isPro: false,            // 是否激活 Pro License
     proLimit: 20,            // 免费版单次最大允许勾选数量
     minWidth: 200,           // 默认最小过滤门槛 200px
@@ -23,7 +23,7 @@
     isDownloading: false,
     cancelRequested: false,       // 用户主动点击“取消下载”标记
     stopAndZipRequested: false,   // 触发150MB保护后用户选择“停止后续下载，仅打包已完成图片”标记
-    downloadMap: new Map(),       // url -> { status: 'idle'|'downloading'|'success'|'failed', error?: string, blob?: Blob, size?: number, filename?: string }
+    downloadMap: new Map(),       // id -> { status: 'idle'|'pending'|'downloading'|'success'|'failed', error?: string, blob?: Blob, size?: number, filename?: string }
     totalDownloadedBytes: 0,
     quotaWarned: false,           // 是否已触发过 150MB 保护警告
     quotaPauseResolver: null,     // 暂停等待用户决策的 Promise resolver
@@ -159,16 +159,15 @@
   }
 
   /**
-   * 严格检验下载内容是否为真实图片（防止伪装为图片的 HTML 错误页/JSON 错误响应等）
-   * 兼容 JPG, PNG, WebP, GIF, SVG, AVIF, BMP, ICO
-   * 仅通过头部魔数（Magic Bytes）或轻量文本探测，不执行高开销的完整解码
+   * 严格检验下载内容是否为真实有效图片（真实文件特征校验）
+   * 必须通过文件头特征（Magic Bytes）或 SVG 规范验证。
+   * MIME 声明绝不能单独证明图片内容有效；无法可靠识别的格式直接拒绝，不把伪图片写入 ZIP。
+   * 兼容支持：JPG, PNG, WebP, GIF, AVIF, SVG, BMP, ICO。
    */
   async function detectAndValidateImageFormat(blob) {
     if (!blob || blob.size < 4) {
-      return { isValid: false, error: '获取到的图片数据过小或为空' };
+      return { isValid: false, error: '获取到的图片数据过小或为空 (小于 4 字节)' };
     }
-
-    const mime = (blob.type || '').toLowerCase();
 
     // 1. 读取前 64 字节检查二进制图片魔数 (Magic Bytes)
     try {
@@ -176,61 +175,74 @@
       const buffer = await slice.arrayBuffer();
       const bytes = new Uint8Array(buffer);
 
-      // JPEG: FF D8 FF
+      // A. JPEG: FF D8 FF
       if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
         return { isValid: true, ext: 'jpg', mime: 'image/jpeg' };
       }
 
-      // PNG: 89 50 4E 47 0D 0A 1A 0A
+      // B. PNG: 89 50 4E 47 0D 0A 1A 0A
       if (bytes.length >= 8 &&
           bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47 &&
           bytes[4] === 0x0D && bytes[5] === 0x0A && bytes[6] === 0x1A && bytes[7] === 0x0A) {
         return { isValid: true, ext: 'png', mime: 'image/png' };
       }
 
-      // GIF: 'GIF87a' 或 'GIF89a'
+      // C. GIF: 'GIF87a' 或 'GIF89a'
       if (bytes.length >= 6 &&
           bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 &&
           bytes[3] === 0x38 && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) {
         return { isValid: true, ext: 'gif', mime: 'image/gif' };
       }
 
-      // WebP: 'RIFF' .... 'WEBP'
+      // D. WebP: 0..3 为 'RIFF', 8..11 为 'WEBP'
       if (bytes.length >= 12 &&
           bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
           bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
         return { isValid: true, ext: 'webp', mime: 'image/webp' };
       }
 
-      // AVIF: 检查 ISO BMFF 'ftyp' 与 brand 'avif' / 'avis' / 'mif1'
+      // E. AVIF: 4..7 为 'ftyp'，且 major brand 或 compatible brands 必须明确包含 'avif' 或 'avis'
+      // 严禁将一般的 'mif1' 或 'heic' 盲目当作 AVIF 识别
       if (bytes.length >= 12 &&
           bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
-        const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]).toLowerCase();
-        if (brand === 'avif' || brand === 'avis' || brand === 'mif1') {
+        const majorBrand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]).toLowerCase();
+        let isAvif = (majorBrand === 'avif' || majorBrand === 'avis');
+
+        if (!isAvif && bytes.length >= 20) {
+          for (let offset = 16; offset + 4 <= bytes.length; offset += 4) {
+            const compBrand = String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]).toLowerCase();
+            if (compBrand === 'avif' || compBrand === 'avis') {
+              isAvif = true;
+              break;
+            }
+          }
+        }
+
+        if (isAvif) {
           return { isValid: true, ext: 'avif', mime: 'image/avif' };
         }
       }
 
-      // BMP: 'BM'
+      // F. BMP: 'BM'
       if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4D) {
         return { isValid: true, ext: 'bmp', mime: 'image/bmp' };
       }
 
-      // ICO: 00 00 01 00
+      // G. ICO: 00 00 01 00
       if (bytes.length >= 4 && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x01 && bytes[3] === 0x00) {
         return { isValid: true, ext: 'ico', mime: 'image/x-icon' };
       }
     } catch {
-      // 继续尝试文本探测
+      // 忽略读取异常，继续尝试文本探测
     }
 
-    // 2. 文本类图片 (如 SVG) 及 HTML/JSON 伪装探测（读取前 512 字节）
+    // 2. 文本类图片 (如 SVG) 及明确的 HTML/JSON 伪装探测（读取前 512 字节）
     try {
       const textSlice = blob.slice(0, 512);
       const textBuffer = await textSlice.arrayBuffer();
       const text = new TextDecoder('utf-8').decode(textBuffer).trim().toLowerCase();
 
-      // 明确拦截：HTML 错误页（如 404/500/Cloudflare 拦截）或 JSON 接口响应
+      // 明确拦截：HTML 错误页（如 404/500/Cloudflare 拦截等）或 JSON 接口响应
       if (text.startsWith('<!doctype html') ||
           text.startsWith('<html') ||
           text.includes('<head>') ||
@@ -241,7 +253,7 @@
         return { isValid: false, error: '目标地址返回了 HTML 错误页或 JSON 数据，非有效图片' };
       }
 
-      // 验证 SVG 矢量图
+      // 验证是否符合 SVG 矢量图规范
       if (text.includes('<svg') && (text.includes('xmlns') || text.includes('viewbox') || text.includes('<path') || text.includes('<g') || text.includes('<circle') || text.includes('<rect') || text.startsWith('<svg'))) {
         return { isValid: true, ext: 'svg', mime: 'image/svg+xml' };
       }
@@ -249,16 +261,8 @@
       // 忽略
     }
 
-    // 3. 兜底检查：若 mime 明确为 image/* 且未命中 html/json
-    if (mime.startsWith('image/')) {
-      const sub = mime.substring(6).split('+')[0];
-      if (['jpeg', 'jpg', 'png', 'webp', 'gif', 'svg', 'avif', 'bmp', 'x-icon', 'vnd.microsoft.icon'].includes(sub)) {
-        const cleanExt = (sub === 'jpeg' || sub === 'jpg') ? 'jpg' : (sub.includes('icon') ? 'ico' : sub);
-        return { isValid: true, ext: cleanExt, mime: mime };
-      }
-    }
-
-    return { isValid: false, error: '文件内容非受支持的有效图片格式 (Magic Bytes 校验未通过)' };
+    // 严禁根据 MIME 声明放行未通过文件特征校验的数据
+    return { isValid: false, error: '文件内容非受支持的有效图片格式 (Magic Bytes 文件头校验未通过)' };
   }
 
   function enhanceToHighResUrl(rawUrl) {
@@ -443,7 +447,12 @@
         }
       });
 
-      state.allImages = Array.from(dedupeMap.values());
+      // 统一图片身份管理：每张去重后的图片分配唯一全局 id (如 img_1, img_2...)
+      // 保证画廊展示、多选集合、下载队列、卡片 UI 状态与错误报告一一对应，杜绝增强后 URL 相同导致的覆盖
+      state.allImages = Array.from(dedupeMap.values()).map((item, idx) => ({
+        ...item,
+        id: `img_${idx + 1}`
+      }));
 
       // 默认全选前 20 张（或全部若小于 20 张）
       applyFilters();
@@ -457,10 +466,10 @@
   }
 
   function preselectInitialImages() {
-    state.selectedUrls.clear();
+    state.selectedIds.clear();
     const limit = state.isPro ? state.filteredImages.length : Math.min(state.proLimit, state.filteredImages.length);
     for (let i = 0; i < limit; i++) {
-      state.selectedUrls.add(state.filteredImages[i].url);
+      state.selectedIds.add(state.filteredImages[i].id);
     }
     updateSelectionSummary();
     renderGallery();
@@ -514,19 +523,21 @@
 
     state.filteredImages.forEach((img, idx) => {
       const card = document.createElement('div');
-      const isSelected = state.selectedUrls.has(img.url);
-      const dlInfo = state.downloadMap.get(img.url);
+      const isSelected = state.selectedIds.has(img.id);
+      const dlInfo = state.downloadMap.get(img.id);
 
       card.className = `image-card ${isSelected ? 'selected' : ''} ${dlInfo && dlInfo.status === 'failed' ? 'card-failed' : ''}`;
+      card.dataset.id = img.id;
       card.dataset.url = img.url;
 
       const format = detectImageFormat(img);
       const isLarge = (img.width >= 1000 || img.height >= 1000);
       const resText = (img.width > 0 && img.height > 0) ? `${img.width} × ${img.height}` : '未知尺寸';
 
+      // 遵守 MV3 CSP: 不在 innerHTML 中使用内联 onerror 事件属性
       card.innerHTML = `
         <div class="card-thumb-wrapper">
-          <img src="${escapeHtml(img.url)}" alt="${escapeHtml(img.alt || 'image')}" loading="lazy" ${img.originalUrl && img.originalUrl !== img.url ? `onerror="if(this.dataset.fallback && this.src !== this.dataset.fallback){this.src=this.dataset.fallback;}" data-fallback="${escapeHtml(img.originalUrl)}"` : ''} />
+          <img src="${escapeHtml(img.url)}" alt="${escapeHtml(img.alt || 'image')}" loading="lazy" />
         </div>
 
         <div class="card-checkbox-wrapper">
@@ -546,7 +557,7 @@
               <line x1="8" y1="11" x2="14" y2="11"></line>
             </svg>
           </button>
-          <button class="action-btn-circle btn-card-download" title="单张下载" data-url="${escapeHtml(img.url)}">
+          <button class="action-btn-circle btn-card-download" title="单张下载" data-id="${escapeHtml(img.id)}">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
               <polyline points="7 10 12 15 17 10"></polyline>
@@ -563,6 +574,20 @@
           <span class="badge" style="font-size: 10px; color: var(--text-dim);">${img.source || 'img'}</span>
         </div>
       `;
+
+      // 修复 2：通过纯 JS 事件绑定实现高清预览失败时回退原始地址，杜绝内联 onerror 违反 CSP，防止无限回退
+      const thumbImg = card.querySelector('.card-thumb-wrapper img');
+      const fallbackCandidate = (img.originalUrl && img.originalUrl !== img.url)
+        ? img.originalUrl
+        : (img.fallbackUrl && img.fallbackUrl !== img.url ? img.fallbackUrl : null);
+
+      if (thumbImg && fallbackCandidate) {
+        thumbImg.addEventListener('error', function onThumbError() {
+          if (this.dataset.fallbackAttempted === 'true') return;
+          this.dataset.fallbackAttempted = 'true';
+          this.src = fallbackCandidate;
+        }, { once: true });
+      }
 
       // 如果有下载状态覆盖层
       if (dlInfo && dlInfo.status !== 'idle') {
@@ -587,11 +612,11 @@
         card.appendChild(overlay);
       }
 
-      // 卡片点击事件：切换多选
+      // 卡片点击事件：切换多选 (使用统一图片 ID)
       card.addEventListener('click', (e) => {
         // 如果点击的是放大镜或单张下载按钮，不触发卡片选中切换
         if (e.target.closest('.card-hover-actions')) return;
-        toggleSelectImage(img.url, card);
+        toggleSelectImage(img.id, card);
       });
 
       // 绑定悬浮按钮事件
@@ -604,7 +629,7 @@
       const btnCardDownload = card.querySelector('.btn-card-download');
       btnCardDownload.addEventListener('click', (e) => {
         e.stopPropagation();
-        downloadSingleImage(img.url);
+        downloadSingleImage(img.id);
       });
 
       fragment.appendChild(card);
@@ -631,21 +656,21 @@
   }
 
   // -------------------------------------------------------------
-  // 6. 选中与商业配额拦截逻辑 (Max 20 for Free)
+  // 6. 选中与商业配额拦截逻辑 (Max 20 for Free, 统一基于 img.id 识别)
   // -------------------------------------------------------------
-  function toggleSelectImage(url, cardEl) {
-    const isCurrentlySelected = state.selectedUrls.has(url);
+  function toggleSelectImage(id, cardEl) {
+    const isCurrentlySelected = state.selectedIds.has(id);
 
     if (isCurrentlySelected) {
-      state.selectedUrls.delete(url);
+      state.selectedIds.delete(id);
       if (cardEl) cardEl.classList.remove('selected');
     } else {
       // 检查免费版 20 张配额上限
-      if (!state.isPro && state.selectedUrls.size >= state.proLimit) {
+      if (!state.isPro && state.selectedIds.size >= state.proLimit) {
         showProModal(true, '免费版单次最多勾选 20 张图片，请升级 Pro 解锁无限批量导出！');
         return;
       }
-      state.selectedUrls.add(url);
+      state.selectedIds.add(id);
       if (cardEl) cardEl.classList.add('selected');
     }
 
@@ -653,7 +678,7 @@
   }
 
   function updateSelectionSummary() {
-    const selectedCount = state.selectedUrls.size;
+    const selectedCount = state.selectedIds.size;
     const visibleCount = state.filteredImages.length;
 
     dom.statSelectedCount.textContent = selectedCount;
@@ -671,13 +696,13 @@
     if (state.filteredImages.length === 0) return;
 
     if (!state.isPro && state.filteredImages.length > state.proLimit) {
-      state.selectedUrls.clear();
+      state.selectedIds.clear();
       for (let i = 0; i < state.proLimit; i++) {
-        state.selectedUrls.add(state.filteredImages[i].url);
+        state.selectedIds.add(state.filteredImages[i].id);
       }
       showProModal(true, `免费版已为您自动勾选前 ${state.proLimit} 张。升级 Pro 会员可一键全选所有图片！`);
     } else {
-      state.filteredImages.forEach(img => state.selectedUrls.add(img.url));
+      state.filteredImages.forEach(img => state.selectedIds.add(img.id));
     }
 
     renderGallery();
@@ -689,25 +714,25 @@
     const candidates = [];
 
     state.filteredImages.forEach(img => {
-      if (!state.selectedUrls.has(img.url)) {
-        candidates.push(img.url);
+      if (!state.selectedIds.has(img.id)) {
+        candidates.push(img.id);
       }
     });
 
     if (!state.isPro && candidates.length > state.proLimit) {
-      candidates.slice(0, state.proLimit).forEach(url => newSelected.add(url));
+      candidates.slice(0, state.proLimit).forEach(id => newSelected.add(id));
       showProModal(true, `反选结果超过 ${state.proLimit} 张，免费版已为您选取前 ${state.proLimit} 张。`);
     } else {
-      candidates.forEach(url => newSelected.add(url));
+      candidates.forEach(id => newSelected.add(id));
     }
 
-    state.selectedUrls = newSelected;
+    state.selectedIds = newSelected;
     renderGallery();
     updateSelectionSummary();
   }
 
   function selectLargeImagesOnly() {
-    state.selectedUrls.clear();
+    state.selectedIds.clear();
     const largeList = state.filteredImages.filter(img => img.width >= 800 || img.height >= 800);
 
     if (largeList.length === 0) {
@@ -716,10 +741,10 @@
     }
 
     if (!state.isPro && largeList.length > state.proLimit) {
-      largeList.slice(0, state.proLimit).forEach(img => state.selectedUrls.add(img.url));
+      largeList.slice(0, state.proLimit).forEach(img => state.selectedIds.add(img.id));
       showProModal(true, `发现 ${largeList.length} 张高清大图。免费版已勾选前 ${state.proLimit} 张，升级 Pro 可一键导出全部！`);
     } else {
-      largeList.forEach(img => state.selectedUrls.add(img.url));
+      largeList.forEach(img => state.selectedIds.add(img.id));
     }
 
     renderGallery();
@@ -727,7 +752,7 @@
   }
 
   function clearSelection() {
-    state.selectedUrls.clear();
+    state.selectedIds.clear();
     renderGallery();
     updateSelectionSummary();
   }
@@ -736,7 +761,7 @@
   // 7. 并发控制下载池 (Max 3 Concurrency) 与 150MB 数据保护阈值
   // -------------------------------------------------------------
   async function startBatchDownload() {
-    if (state.selectedUrls.size === 0 || state.isDownloading) return;
+    if (state.selectedIds.size === 0 || state.isDownloading) return;
 
     // 严禁外部依赖未载入
     if (typeof JSZip === 'undefined') {
@@ -757,14 +782,14 @@
     dom.errorDetailsList.innerHTML = '';
     dom.errorBadgeCount.textContent = '0 张图片下载失败';
 
-    const targetUrls = Array.from(state.selectedUrls);
-    const totalCount = targetUrls.length;
+    const targetIds = Array.from(state.selectedIds);
+    const totalCount = targetIds.length;
 
     updateConsoleProgress(0, totalCount, '正在初始化下载连接...', `并发限制: ${MAX_CONCURRENCY} | 数据量保护阈值: 150MB`);
 
-    // 初始化每张卡片状态
-    targetUrls.forEach(url => {
-      state.downloadMap.set(url, { status: 'pending' });
+    // 初始化每张卡片状态 (按统一图片 ID 映射)
+    targetIds.forEach(id => {
+      state.downloadMap.set(id, { status: 'pending' });
     });
     renderGallery();
 
@@ -777,11 +802,11 @@
       let currentIndex = 0;
 
       async function worker() {
-        while (currentIndex < targetUrls.length) {
+        while (currentIndex < targetIds.length) {
           if (state.cancelRequested || state.stopAndZipRequested) break;
 
           const myIndex = currentIndex++;
-          const url = targetUrls[myIndex];
+          const id = targetIds[myIndex];
 
           // 检查并等待 150MB 保护锁
           if (state.quotaPauseResolver) {
@@ -789,8 +814,8 @@
           }
           if (state.cancelRequested || state.stopAndZipRequested) break;
 
-          state.downloadMap.set(url, { status: 'downloading' });
-          updateCardStatusUI(url, 'downloading');
+          state.downloadMap.set(id, { status: 'downloading' });
+          updateCardStatusUI(id, 'downloading');
 
           updateConsoleProgress(
             completedCount,
@@ -800,20 +825,20 @@
           );
 
           // 执行下载（含高清->原图自动回退与真实图片格式校验）
-          const imgItem = state.allImages.find(img => img.url === url) || { url };
+          const imgItem = state.allImages.find(img => img.id === id) || { id, url: '' };
           const fetchResult = await fetchImageWithFallback(imgItem);
 
           if (fetchResult.success) {
             const blob = fetchResult.blob;
             state.totalDownloadedBytes += blob.size;
 
-            state.downloadMap.set(url, {
+            state.downloadMap.set(id, {
               status: 'success',
               blob: blob,
               size: blob.size,
-              filename: generateFileName(url, myIndex + 1, fetchResult.mime, fetchResult.ext)
+              filename: generateFileName(imgItem.url || imgItem.originalUrl, myIndex + 1, fetchResult.mime, fetchResult.ext)
             });
-            updateCardStatusUI(url, 'success', blob.size);
+            updateCardStatusUI(id, 'success', blob.size);
 
             // 检查 150MB 数据保护阈值
             if (!state.quotaWarned && state.totalDownloadedBytes >= QUOTA_LIMIT_BYTES) {
@@ -823,12 +848,13 @@
 
           } else {
             failedCount++;
-            failedList.push({ url, error: fetchResult.error });
-            state.downloadMap.set(url, {
+            const reportUrl = imgItem ? (imgItem.originalUrl || imgItem.url) : id;
+            failedList.push({ id, url: reportUrl, error: fetchResult.error });
+            state.downloadMap.set(id, {
               status: 'failed',
               error: fetchResult.error
             });
-            updateCardStatusUI(url, 'failed', 0, fetchResult.error);
+            updateCardStatusUI(id, 'failed', 0, fetchResult.error);
           }
 
           completedCount++;
@@ -840,7 +866,7 @@
 
       // 启动 MAX_CONCURRENCY 个 worker
       const pool = [];
-      const concurrency = Math.min(MAX_CONCURRENCY, targetUrls.length);
+      const concurrency = Math.min(MAX_CONCURRENCY, targetIds.length);
       for (let i = 0; i < concurrency; i++) {
         pool.push(worker());
       }
@@ -862,15 +888,17 @@
 
       // 操作 B：达到 150MB 保护后选择“停止并打包”时，标记未启动的图片为跳过
       if (state.stopAndZipRequested) {
-        targetUrls.forEach(url => {
-          const item = state.downloadMap.get(url);
+        targetIds.forEach(id => {
+          const item = state.downloadMap.get(id);
           if (!item || item.status === 'pending') {
-            state.downloadMap.set(url, {
+            state.downloadMap.set(id, {
               status: 'failed',
               error: '已达 150MB 数据保护上限，已停止下载后续图片'
             });
-            updateCardStatusUI(url, 'failed', 0, '保护阈值跳过');
-            failedList.push({ url, error: '已达 150MB 数据保护上限，已停止下载后续图片' });
+            updateCardStatusUI(id, 'failed', 0, '保护阈值跳过');
+            const imgItem = state.allImages.find(img => img.id === id);
+            const reportUrl = imgItem ? (imgItem.originalUrl || imgItem.url) : id;
+            failedList.push({ id, url: reportUrl, error: '已达 150MB 数据保护上限，已停止下载后续图片' });
           }
         });
       }
@@ -1214,8 +1242,8 @@
     document.body.removeChild(a);
   }
 
-  function updateCardStatusUI(url, status, size = 0, error = '') {
-    const card = dom.galleryGrid.querySelector(`.image-card[data-url="${CSS.escape(url)}"]`);
+  function updateCardStatusUI(id, status, size = 0, error = '') {
+    const card = dom.galleryGrid.querySelector(`.image-card[data-id="${CSS.escape(id)}"]`);
     if (!card) return;
 
     let overlay = card.querySelector('.card-status-overlay');
@@ -1256,7 +1284,7 @@
 
     dom.errorDetailsList.innerHTML = failedList.map(item => `
       <div class="error-item">
-        <span class="err-url" title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</span>
+        <span class="err-url" title="${escapeHtml(item.url || item.id)}">${escapeHtml(item.url || item.id)}</span>
         <span class="err-msg">${escapeHtml(item.error)}</span>
       </div>
     `).join('');
@@ -1265,16 +1293,17 @@
   // -------------------------------------------------------------
   // 8. 单张下载与 Lightbox 大图预览
   // -------------------------------------------------------------
-  async function downloadSingleImage(url) {
+  async function downloadSingleImage(idOrUrl) {
     try {
-      const item = state.allImages.find(img => img.url === url);
-      const fallbackUrl = (item && item.originalUrl !== url) ? item.originalUrl : null;
-      const ext = getUrlExtension(url);
+      const item = state.allImages.find(img => img.id === idOrUrl || img.url === idOrUrl);
+      const targetUrl = item ? item.url : idOrUrl;
+      const fallbackUrl = (item && item.originalUrl && item.originalUrl !== targetUrl) ? item.originalUrl : null;
+      const ext = getUrlExtension(targetUrl);
       const filename = `single_image_${Date.now()}.${ext}`;
 
       if (chrome && chrome.downloads && typeof chrome.downloads.download === 'function') {
         chrome.downloads.download({
-          url: url,
+          url: targetUrl,
           filename: filename,
           saveAs: true
         }, () => {
@@ -1290,29 +1319,49 @@
                 }
               });
             } else {
-              fallbackAnchorDownload(url, filename);
+              fallbackAnchorDownload(targetUrl, filename);
             }
           }
         });
       } else {
-        fallbackAnchorDownload(url, filename);
+        fallbackAnchorDownload(targetUrl, filename);
       }
     } catch {
-      fallbackAnchorDownload(url, `image_${Date.now()}.jpg`);
+      fallbackAnchorDownload(idOrUrl, `image_${Date.now()}.jpg`);
     }
   }
 
   function openLightbox(imgItem) {
+    dom.lightboxImg.dataset.id = imgItem.id || '';
     dom.lightboxImg.src = imgItem.url;
     dom.lightboxResolution.textContent = (imgItem.width && imgItem.height) ? `${imgItem.width} × ${imgItem.height}` : '未知尺寸';
     dom.lightboxFormat.textContent = detectImageFormat(imgItem);
     dom.lightboxUrl.textContent = imgItem.url;
+
+    // 修复 2：大图预览失败时通过 JS 事件绑定安全回退原始地址，杜绝内联 onerror 且防止死循环
+    const fallbackCandidate = (imgItem.originalUrl && imgItem.originalUrl !== imgItem.url)
+      ? imgItem.originalUrl
+      : (imgItem.fallbackUrl && imgItem.fallbackUrl !== imgItem.url ? imgItem.fallbackUrl : null);
+
+    dom.lightboxImg.onerror = null;
+    if (fallbackCandidate) {
+      dom.lightboxImg.onerror = function () {
+        dom.lightboxImg.onerror = null;
+        if (dom.lightboxImg.src !== fallbackCandidate) {
+          dom.lightboxImg.src = fallbackCandidate;
+          dom.lightboxUrl.textContent = fallbackCandidate;
+        }
+      };
+    }
+
     dom.modalLightbox.classList.remove('hidden');
   }
 
   function closeLightbox() {
     dom.modalLightbox.classList.add('hidden');
+    dom.lightboxImg.onerror = null;
     dom.lightboxImg.src = '';
+    dom.lightboxImg.dataset.id = '';
   }
 
   // -------------------------------------------------------------
@@ -1449,8 +1498,13 @@
       }
     });
     dom.btnDownloadSingleImg.addEventListener('click', () => {
+      const id = dom.lightboxImg.dataset.id;
       const url = dom.lightboxUrl.textContent;
-      if (url) downloadSingleImage(url);
+      if (id) {
+        downloadSingleImage(id);
+      } else if (url) {
+        downloadSingleImage(url);
+      }
     });
 
     // ESC 快捷键关闭弹窗
